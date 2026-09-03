@@ -1,0 +1,49 @@
+'''
+Function:
+    Implementation of C56VideoClient
+'''
+import os
+import re
+import json_repair
+from bs4 import BeautifulSoup
+from .base import BaseVideoClient
+from .sohu import SohuVideoClient
+from ..utils import legalizestring, useparseheaderscookies, yieldtimerelatedtitle, VideoInfo
+
+
+'''C56VideoClient'''
+class C56VideoClient(BaseVideoClient):
+    source = 'C56VideoClient'
+    def __init__(self, **kwargs):
+        super(C56VideoClient, self).__init__(**kwargs)
+        self.sohu_parser = SohuVideoClient(**kwargs)
+        self.default_parse_headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36'}
+        self.default_download_headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36'}
+        self.default_headers = self.default_parse_headers
+        self._initsession()
+    '''parsefromurl'''
+    @useparseheaderscookies
+    def parsefromurl(self, url: str, request_overrides: dict = None):
+        # prepare
+        if not self.belongto(url=url): return []
+        request_overrides, video_info, null_backup_title = request_overrides or {}, VideoInfo(source=self.source), yieldtimerelatedtitle(self.source)
+        # try parse
+        try:
+            vid = re.search(r'https?://(?:(?:www|player)\.)?56\.com/(?:.+?/)?(?:v_|(?:play_album.+-))(?P<textid>.+?)\.(?:html|swf)', url).group(1)
+            (resp := self.get(url, **request_overrides)).raise_for_status()
+            script_tag = BeautifulSoup(resp.text, "lxml").find("script", string=re.compile(r"var\s+videoInfo\s*="))
+            script_text: str = script_tag.string; m = re.search(r"var\s+videoInfo\s*=\s*({.*?});", script_text, re.S)
+            raw_data = json_repair.loads(m.group(1)); sohu_video_url = raw_data['sohu']['video_url']
+            video_info: VideoInfo = self.sohu_parser.parsefromurl(sohu_video_url, request_overrides=request_overrides)[0]
+            video_title = legalizestring(raw_data.get('Subject', null_backup_title), replace_null_string=null_backup_title).removesuffix('.')
+            video_info.update(dict(identifier=vid, raw_data=raw_data, title=video_title, save_path=os.path.join(self.work_dir, self.source, f'{video_title}.{video_info.ext}'), source=self.source, cover_url=raw_data.get('img')))
+        except Exception as err:
+            video_info.update(dict(err_msg=(err_msg := f'{self.source}.parsefromurl >>> {url} (Error: {err})')))
+            self.logger_handle.error(err_msg, disable_print=self.disable_print)
+        # return
+        return [video_info]
+    '''belongto'''
+    @staticmethod
+    def belongto(url: str, valid_domains: list[str] | set[str] = None):
+        valid_domains = set(valid_domains or []) | {"56.com"}
+        return BaseVideoClient.belongto(url, valid_domains)

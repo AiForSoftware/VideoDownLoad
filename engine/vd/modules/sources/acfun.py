@@ -1,0 +1,48 @@
+'''
+Function:
+    Implementation of AcFunVideoClient
+'''
+import re
+import os
+import json_repair
+from .base import BaseVideoClient
+from urllib.parse import urlparse
+from ..utils import legalizestring, useparseheaderscookies, yieldtimerelatedtitle, searchdictbykey, VideoInfo
+
+
+'''AcFunVideoClient'''
+class AcFunVideoClient(BaseVideoClient):
+    source = 'AcFunVideoClient'
+    def __init__(self, **kwargs):
+        super(AcFunVideoClient, self).__init__(**kwargs)
+        self.default_parse_headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36'}
+        self.default_download_headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36'}
+        self.default_headers = self.default_parse_headers
+        self._initsession()
+    '''parsefromurl'''
+    @useparseheaderscookies
+    def parsefromurl(self, url: str, request_overrides: dict = None):
+        # prepare
+        if not self.belongto(url=url): return []
+        request_overrides, video_info, null_backup_title = request_overrides or {}, VideoInfo(download_with_ffmpeg=True, source=self.source), yieldtimerelatedtitle(self.source)
+        # try parse
+        try:
+            vid = urlparse(url).path.strip('/').split('/')[-1]
+            (resp := self.get(url, **request_overrides)).raise_for_status()
+            video_info.update(dict(raw_data=(raw_data := json_repair.loads(str(re.findall('window.pageInfo =(.*?);', resp.text)[0]).split('=', 1)[-1].strip()))))
+            try: download_url = json_repair.loads(raw_data['currentVideoInfo']['ksPlayJsonHevc'])['adaptationSet'][0]['representation'][0]['url']
+            except Exception: download_url = json_repair.loads(raw_data['currentVideoInfo']['ksPlayJson'])['adaptationSet'][0]['representation'][0]['url']
+            video_info.update(dict(download_url=download_url))
+            video_title = legalizestring(raw_data.get('title', null_backup_title), replace_null_string=null_backup_title).removesuffix('.')
+            cover_url = searchdictbykey(raw_data, 'coverUrl'); cover_url = cover_url[0] if cover_url and isinstance(cover_url, list) else None
+            video_info.update(dict(title=video_title, save_path=os.path.join(self.work_dir, self.source, f'{video_title}.{video_info.ext}'), identifier=vid, cover_url=cover_url))
+        except Exception as err:
+            video_info.update(dict(err_msg=(err_msg := f'{self.source}.parsefromurl >>> {url} (Error: {err})')))
+            self.logger_handle.error(err_msg, disable_print=self.disable_print)
+        # return
+        return [video_info]
+    '''belongto'''
+    @staticmethod
+    def belongto(url: str, valid_domains: list[str] | set[str] = None):
+        valid_domains = set(valid_domains or []) | {"acfun.cn"}
+        return BaseVideoClient.belongto(url, valid_domains)

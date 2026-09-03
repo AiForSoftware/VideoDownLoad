@@ -1,0 +1,57 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+build/
+develop-eggs/
+downloads/
+eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg
+
+# ===== PyInstaller 构建产物 =====
+dist/
+build/
+release_v*/
+*.spec.bak
+
+# ===== 测试输出 =====
+_smoke_out/
+_selftest_output/
+vd_selftest_output/
+*.downloads/
+
+# ===== IDE / 编辑器 =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ===== 日志 =====
+*.log
+
+# ===== Node (如果有) =====
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ===== 临时文件 =====
+*.tmp
+*.bak
+*.orig

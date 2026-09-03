@@ -1,0 +1,64 @@
+'''
+Function:
+    Implementation of YoukuVideoClient
+'''
+import os
+import time
+import random
+import string
+from .base import BaseVideoClient
+from ..utils.domains import YOUKU_SUFFIXES
+from urllib.parse import urlparse, parse_qs
+from ..utils import legalizestring, useparseheaderscookies, resp2json, yieldtimerelatedtitle, safeextractfromdict, FileTypeSniffer, VideoInfo
+
+
+'''YoukuVideoClient'''
+class YoukuVideoClient(BaseVideoClient):
+    source = 'YoukuVideoClient'
+    def __init__(self, **kwargs):
+        super(YoukuVideoClient, self).__init__(**kwargs)
+        self.default_parse_headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36'}
+        self.default_download_headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36'}
+        self.default_headers = self.default_parse_headers
+        if not self.default_parse_cookies: self.default_parse_cookies = {'__ysuid': self._getysuid(), 'xreferrer': 'http://www.youku.com'}
+        self._initsession()
+    '''_getysuid'''
+    def _getysuid(self):
+        return "{}{}".format(int(time.time()), ''.join(random.choices(string.ascii_letters, k=3)))
+    '''_getformatname'''
+    def _getformatname(self, fm):
+        return {'3gp': 'h6', '3gphd': 'h5', 'flv': 'h4', 'flvhd': 'h4', 'mp4': 'h3', 'mp4hd': 'h3', 'mp4hd2': 'h4', 'mp4hd3': 'h4', 'hd2': 'h2', 'hd3': 'h1'}.get(fm)
+    '''parsefromurl'''
+    @useparseheaderscookies
+    def parsefromurl(self, url: str, request_overrides: dict = None) -> list[VideoInfo]:
+        # prepare
+        if not self.belongto(url=url): return []
+        request_overrides, video_info, null_backup_title = request_overrides or {}, VideoInfo(source=self.source, download_with_ffmpeg=True), yieldtimerelatedtitle(self.source)
+        # try parse
+        try:
+            try: vid = parse_qs(urlparse(url).query, keep_blank_values=True)['vid'][0]
+            except: vid = urlparse(url).path.strip('/').split('/')[-1].removesuffix('.html').removeprefix('id_')
+            (resp := self.get('https://log.mmstat.com/eg.js', **request_overrides)).raise_for_status()
+            params = {'vid': vid, 'ccode': '0564', 'client_ip': '192.168.1.1', 'utid': (resp.headers.get('ETag') or resp.headers.get('etag')).strip('"'), 'client_ts': int(time.time())} # [0564, 0566, 0568]
+            (headers := dict(self.default_headers)).update({'Referer': url})
+            (resp := self.get(f'https://ups.youku.com/ups/get.json', params=params, headers=headers, **request_overrides)).raise_for_status()
+            video_info.update(dict(raw_data=(raw_data := resp2json(resp=resp)))); video_data = raw_data.get('data') or {}
+            video_urls = [{'url': stream.get('m3u8_url'), 'filesize': int(stream.get('size', 0) or 0), 'width': int(stream.get('width', 0) or 0), 'height': int(stream.get('height', 0) or 0)} for stream in video_data.get('stream', []) if isinstance(stream, dict) and stream.get('channel_type') != 'tail']
+            video_urls_sorted = sorted(video_urls, key=lambda f: (f.get('height') or 0, f.get('width') or 0, f.get('filesize') or 0), reverse=True)
+            video_urls_sorted = [v for v in video_urls_sorted if v.get('url')]
+            video_info.update(dict(download_url=(download_url := video_urls_sorted[0]['url'])))
+            video_title = legalizestring(safeextractfromdict(video_data, ['video', 'title'], null_backup_title), replace_null_string=null_backup_title).removesuffix('.')
+            guess_video_ext_result = FileTypeSniffer.getfileextensionfromurl(url=download_url, headers=self.default_download_headers, request_overrides=request_overrides, cookies=self.default_download_cookies)
+            ext = guess_video_ext_result['ext'] if guess_video_ext_result['ext'] and guess_video_ext_result['ext'] != 'NULL' else video_info.ext
+            cover_url = safeextractfromdict(raw_data, ['data', 'video', 'logo'], None) or safeextractfromdict(raw_data, ['data', 'preview', 'thumb_hd', 0], None)
+            video_info.update(dict(title=video_title, save_path=os.path.join(self.work_dir, self.source, f'{video_title}.{ext}'), ext=ext, guess_video_ext_result=guess_video_ext_result, identifier=vid, cover_url=cover_url))
+        except Exception as err:
+            video_info.update(dict(err_msg=(err_msg := f'{self.source}.parsefromurl >>> {url} (Error: {err})')))
+            self.logger_handle.error(err_msg, disable_print=self.disable_print)
+        # return
+        return [video_info]
+    '''belongto'''
+    @staticmethod
+    def belongto(url: str, valid_domains: list[str] | set[str] = None):
+        valid_domains = set(valid_domains or []) | YOUKU_SUFFIXES
+        return BaseVideoClient.belongto(url, valid_domains)

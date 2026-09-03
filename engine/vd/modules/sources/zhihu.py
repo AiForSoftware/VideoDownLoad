@@ -1,0 +1,50 @@
+'''
+Function:
+    Implementation of ZhihuVideoClient
+'''
+import os
+from .base import BaseVideoClient
+from urllib.parse import urlparse
+from ..utils import legalizestring, useparseheaderscookies, resp2json, yieldtimerelatedtitle, safeextractfromdict, FileTypeSniffer, VideoInfo
+
+
+'''ZhihuVideoClient'''
+class ZhihuVideoClient(BaseVideoClient):
+    source = 'ZhihuVideoClient'
+    def __init__(self, **kwargs):
+        super(ZhihuVideoClient, self).__init__(**kwargs)
+        self.default_parse_headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',}
+        self.default_download_headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',}
+        self.default_headers = self.default_parse_headers
+        self._initsession()
+    '''parsefromurl'''
+    @useparseheaderscookies
+    def parsefromurl(self, url: str, request_overrides: dict = None) -> list[VideoInfo]:
+        # prepare
+        if not self.belongto(url=url): return []
+        request_overrides, video_info, null_backup_title = request_overrides or {}, VideoInfo(source=self.source), yieldtimerelatedtitle(self.source)
+        quality_score_func = lambda info: ((info.get("width") or 0) * (info.get("height") or 0), (info.get("bitrate") or 0.0), (info.get("size") or 0))
+        # try parse
+        try:
+            vid = urlparse(url).path.strip('/').split('/')[-1]
+            (resp := self.get(f'https://www.zhihu.com/api/v4/zvideos/{vid}', **request_overrides)).raise_for_status()
+            video_info.update(dict(raw_data=(raw_data := resp2json(resp=resp))))
+            playlist: dict = raw_data["video"]["playlist"]
+            sorted_playlist: list[tuple[dict]] = sorted(playlist.items(), key=lambda kv: quality_score_func(kv[1]), reverse=True)
+            sorted_playlist = [s for s in sorted_playlist if s[1].get('url')]
+            download_url = sorted_playlist[0][1]['url']; video_info.update(dict(download_url=download_url))
+            video_title = legalizestring(raw_data.get('title', null_backup_title), replace_null_string=null_backup_title).removesuffix('.')
+            guess_video_ext_result = FileTypeSniffer.getfileextensionfromurl(url=download_url, headers=self.default_download_headers, request_overrides=request_overrides, cookies=self.default_download_cookies)
+            ext = guess_video_ext_result['ext'] if guess_video_ext_result['ext'] and guess_video_ext_result['ext'] != 'NULL' else video_info.ext
+            cover_url = safeextractfromdict(raw_data, ['video', 'thumbnail'], None)
+            video_info.update(dict(title=video_title, save_path=os.path.join(self.work_dir, self.source, f'{video_title}.{ext}'), ext=ext, guess_video_ext_result=guess_video_ext_result, identifier=vid, cover_url=cover_url))
+        except Exception as err:
+            video_info.update(dict(err_msg=(err_msg := f'{self.source}.parsefromurl >>> {url} (Error: {err})')))
+            self.logger_handle.error(err_msg, disable_print=self.disable_print)
+        # return
+        return [video_info]
+    '''belongto'''
+    @staticmethod
+    def belongto(url: str, valid_domains: list[str] | set[str] = None):
+        valid_domains = set(valid_domains or []) | {"zhihu.com"}
+        return BaseVideoClient.belongto(url, valid_domains)
