@@ -544,13 +544,71 @@ class ProtoInt64:
 
 
 '''RequestWrapper'''
+'''Response adapter to make curl_cffi Response compatible with urllib response interface'''
+class _CurlResponseAdapter:
+    def __init__(self, resp):
+        self._resp = resp
+        self._content = None
+    def read(self):
+        if self._content is None: self._content = self._resp.content
+        return self._content
+    def info(self):
+        return self._resp.headers
+    @property
+    def status(self): return self._resp.status_code
+    @property
+    def headers(self): return self._resp.headers
+
+
+'''RequestWrapper - uses curl_cffi for TLS fingerprint impersonation'''
 class RequestWrapper:
     default_range_size = 9437184
+    _curl_session = None
+    _curl_available = None
+
+    '''Get or create a singleton curl_cffi session with Chrome TLS impersonation'''
+    @staticmethod
+    def _get_curl_session():
+        if RequestWrapper._curl_available is False: return None
+        if RequestWrapper._curl_session is not None: return RequestWrapper._curl_session
+        try:
+            from curl_cffi import requests as curl_requests
+            session = curl_requests.Session(impersonate='chrome')
+            # Set YouTube consent cookies to bypass consent wall
+            session.cookies.set('SOCS', 'CAISAQAD', domain='.youtube.com')
+            session.cookies.set('CONSENT', 'YES+1', domain='.youtube.com')
+            RequestWrapper._curl_session = session
+            RequestWrapper._curl_available = True
+            return session
+        except ImportError:
+            RequestWrapper._curl_available = False
+            return None
+
+    '''Reset the curl_cffi session to clear poisoned cookies (call when LOGIN_REQUIRED)'''
+    @staticmethod
+    def reset_curl_session():
+        RequestWrapper._curl_session = None
+
     '''_executerequest'''
     @staticmethod
     def _executerequest(url: str, method=None, headers=None, data=None, timeout=socket._GLOBAL_DEFAULT_TIMEOUT):
         base_headers = {"User-Agent": "Mozilla/5.0", "accept-language": "en-US,en"}
         if headers: base_headers.update(headers)
+        # Try curl_cffi with TLS impersonation first
+        session = RequestWrapper._get_curl_session()
+        if session is not None:
+            try:
+                kwargs = {'headers': base_headers, 'timeout': timeout if timeout != socket._GLOBAL_DEFAULT_TIMEOUT else 30}
+                if data is not None:
+                    if isinstance(data, (bytes, bytearray)):
+                        kwargs['data'] = data
+                    else:
+                        kwargs['json'] = data
+                resp = session.request(method or 'GET', url, **kwargs)
+                return _CurlResponseAdapter(resp)
+            except Exception:
+                pass
+        # Fallback to urllib
         if data and not isinstance(data, bytes): data = bytes(json.dumps(data), encoding="utf-8")
         if url.lower().startswith("http"): request = Request(url, headers=base_headers, method=method, data=data)
         else: raise ValueError("Invalid URL")
@@ -3157,20 +3215,10 @@ class InnerTube:
             if self.access_po_token: self.insertpotoken()
             else: self.fetchpotoken()
         headers.update(self.header)
-        # Use curl_cffi for TLS fingerprint impersonation (bypasses YouTube's bot detection)
-        # Falls back to urllib if curl_cffi is not available
-        try:
-            from curl_cffi import requests as curl_requests
-            session = curl_requests.Session(impersonate='chrome')
-            # Set YouTube consent cookie to bypass consent wall
-            session.cookies.set('SOCS', 'CAISAQAD', domain='.youtube.com')
-            session.cookies.set('CONSENT', 'YES+1', domain='.youtube.com')
-            resp = session.post(endpoint_url, headers=headers, json=data, timeout=15)
-            return resp.json()
-        except ImportError:
-            # Fallback to urllib if curl_cffi is not installed
-            resp = RequestWrapper._executerequest(endpoint_url, 'POST', headers=headers, data=data)
-            return json.loads(resp.read())
+        # RequestWrapper uses curl_cffi singleton session with Chrome TLS impersonation
+        # (bypasses YouTube's bot detection + cookie persistence)
+        resp = RequestWrapper._executerequest(endpoint_url, 'POST', headers=headers, data=data)
+        return json.loads(resp.read())
     '''browse'''
     def browse(self, continuation=None, visitor_data=None):
         endpoint = f'{self.baseurl}/browse'
@@ -3383,7 +3431,7 @@ class YouTube:
         self.embed_url = f"https://www.youtube.com/embed/{self.video_id}"
         self.client = client
         self.client = 'TV' if use_oauth else self.client
-        self.fallback_clients = ['WEB_EMBED', 'ANDROID_VR', 'TV', 'IOS']
+        self.fallback_clients = ['ANDROID_VR', 'WEB_EMBED', 'TV', 'IOS']
         self._signature_timestamp: dict = {}
         self._visitor_data = None
         self.stream_monostate = Monostate(on_progress=on_progress_callback, on_complete=on_complete_callback, youtube=self)
@@ -3537,13 +3585,23 @@ class YouTube:
             if self.use_po_token or innertube.require_po_token: self.po_token = innertube.access_po_token or self.pot
             return response
         innertube_response = callinnertube_func(optional_client)
+        # Fallback chain: try other clients if the current one is blocked (LOGIN_REQUIRED,
+        # UNPLAYABLE, error response, etc.) or if no streaming data was returned.
         for client in self.fallback_clients:
-            playability_status = innertube_response['playabilityStatus']
-            if playability_status['status'] == 'UNPLAYABLE' and 'reason' in playability_status and playability_status['reason'] == 'This video is not available':
-                self.client = client
-                innertube_response = callinnertube_func(client)
-            else:
+            playability_status = innertube_response.get('playabilityStatus', {})
+            status = playability_status.get('status', 'ERROR')
+            streaming_data = innertube_response.get('streamingData', {})
+            has_streams = bool(streaming_data.get('formats') or streaming_data.get('adaptiveFormats'))
+            if status == 'OK' and has_streams:
                 break
+            # Current client failed, try next fallback client
+            self.client = client
+            # Reset curl_cffi session to clear poisoned cookies before next attempt
+            RequestWrapper.reset_curl_session()
+            try:
+                innertube_response = callinnertube_func(client)
+            except Exception:
+                continue
         return innertube_response
     '''vid_details'''
     @property
