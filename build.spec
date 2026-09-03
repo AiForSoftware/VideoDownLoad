@@ -98,6 +98,7 @@ hiddenimports += ['curl_cffi', 'freeproxy', 'clr_loader', 'pythonnet',
 
 '''binaries'''
 binaries = collect_dynamic_libs('webview')
+binaries += collect_dynamic_libs('curl_cffi')
 
 '''modules that are never used by this app'''
 excludes = ['tkinter', 'PyQt5', 'PySide2', 'PySide6', 'pytest', 'IPython', 'notebook']

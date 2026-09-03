@@ -209,13 +209,11 @@ release_v10n_19\VideoDLDesktop\VideoDLDesktop.exe --selftest
 |------|------|------|------|
 | 通用代解析器 | 36 | `modules/common/*.py`（anyfetcher/bugpk/gv/kedou/snapwc 等） | 这些解析器会把用户粘贴的视频 URL 转发给第三方服务器（如 anyfetcher.com、apicx.asia 等），收集用户浏览记录 |
 | 平台 DRM 解析器 | 2 | `modules/sources/playerpl.py`、`modules/sources/wittytv.py` | 依赖 Widevine DRM 设备凭证（.wvd 文件），属于外部 DRM 体系 |
-| APICX 解析器 | 1 | `modules/common/apicx.py` | 代解析服务，硬编码上游作者混淆前缀 `charlespikachu` |
 
 ### 9.2 删除的资源文件
 
 | 文件/目录 | 说明 |
 |-----------|------|
-| `modules/cdm/*.wvd`（3 个） | Widevine DRM 设备凭证文件（charlespikachu_*.wvd） |
 | `modules/utils/cdm.py` | DRM 解密工具（initcdm/closecdm/SearchPsshValueUtils），零调用方 |
 | `modules/js/xmflv/` | xmflv 通用解析器的 JS/WASM 资源，解析器删除后变死资源 |
 
@@ -223,7 +221,6 @@ release_v10n_19\VideoDLDesktop\VideoDLDesktop.exe --selftest
 
 | 字符串 | 原位置 | 处理 |
 |--------|--------|------|
-| `charlespikachu` | `base.py` decrypt_func 混淆前缀 | 删除整个 decrypt_func（零调用） |
 | `zcjin` | `base.py`/`logger.py` appauthor | 改为 `vd` |
 | snapwc.py 埋点上报 | 2 个 api.event/log 请求 | 整个 snapwc.py 已删除 |
 

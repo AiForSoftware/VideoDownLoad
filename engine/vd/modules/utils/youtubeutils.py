@@ -77,7 +77,7 @@ DEFAULT_CLIENTS = {
         'api_key': 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8', 'require_js_player': True, 'require_po_token': False
     },
     'ANDROID': {
-        'innertube_context': {'context': {'client': {'clientName': 'ANDROID', 'clientVersion': '20.10.38', 'platform': 'MOBILE', 'osName': 'Android', 'osVersion': '14', 'androidSdkVersion': '30'}}},
+        'innertube_context': {'context': {'client': {'clientName': 'ANDROID', 'clientVersion': '20.10.38', 'platform': 'MOBILE', 'osName': 'Android', 'osVersion': '14', 'androidSdkVersion': '30', 'hl': 'en', 'gl': 'US'}}},
         'header': {'User-Agent': 'com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip', 'X-Youtube-Client-Name': '3', 'X-Youtube-Client-Version': '20.10.38'},
         'api_key': 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8', 'require_js_player': False, 'require_po_token': False
     },
@@ -3157,8 +3157,20 @@ class InnerTube:
             if self.access_po_token: self.insertpotoken()
             else: self.fetchpotoken()
         headers.update(self.header)
-        resp = RequestWrapper._executerequest(endpoint_url, 'POST', headers=headers, data=data)
-        return json.loads(resp.read())
+        # Use curl_cffi for TLS fingerprint impersonation (bypasses YouTube's bot detection)
+        # Falls back to urllib if curl_cffi is not available
+        try:
+            from curl_cffi import requests as curl_requests
+            session = curl_requests.Session(impersonate='chrome')
+            # Set YouTube consent cookie to bypass consent wall
+            session.cookies.set('SOCS', 'CAISAQAD', domain='.youtube.com')
+            session.cookies.set('CONSENT', 'YES+1', domain='.youtube.com')
+            resp = session.post(endpoint_url, headers=headers, json=data, timeout=15)
+            return resp.json()
+        except ImportError:
+            # Fallback to urllib if curl_cffi is not installed
+            resp = RequestWrapper._executerequest(endpoint_url, 'POST', headers=headers, data=data)
+            return json.loads(resp.read())
     '''browse'''
     def browse(self, continuation=None, visitor_data=None):
         endpoint = f'{self.baseurl}/browse'
