@@ -560,15 +560,19 @@ function applyParseResult(data) {
         // user knows what to do instead of staring at a cryptic tag.
         const firstErr = (state.items.find((i) => i.err_msg) || {}).err_msg || '所有资源均无有效地址';
         const isAntiBot = /412|403|Precondition|FORBIDDEN|access.denied|Forbidden/i.test(firstErr);
+        const isYouTube = /YouTube|youtube/i.test(firstErr);
         const noCookie = !(state.config && state.config.cookies);
         $('parseHint').className = 'hint err';
-        if (isAntiBot && noCookie) {
+        if (isYouTube) {
+            $('parseHint').textContent = '解析失败：YouTube 反爬拦截（IP 被标记）。' + firstErr.slice(0, 200);
+        } else if (isAntiBot && noCookie) {
             $('parseHint').textContent = '解析失败：网站返回 412/403（反爬限制），所有资源均无有效地址。请打开「设置」粘贴该网站（抖音等）的浏览器 Cookie 后重试。';
         } else if (isAntiBot) {
             $('parseHint').textContent = '解析失败：网站返回 412/403（反爬），所有资源均无有效地址。当前 Cookie 可能已失效，请更新后重试。';
         } else {
-            $('parseHint').textContent = '解析失败：所有资源均无有效地址（' + firstErr.slice(0, 80) + '）';
+            $('parseHint').textContent = '解析失败：所有资源均无有效地址（' + firstErr.slice(0, 200) + '）';
         }
+        $('parseHint').title = firstErr;
         toast('解析失败：所有资源均无有效地址', 'err');
     } else {
         const cnt = state.items.length;

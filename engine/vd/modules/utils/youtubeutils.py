@@ -569,6 +569,7 @@ class RequestWrapper:
     default_range_size = 9437184
     _curl_session = None
     _curl_available = None
+    _curl_init_logged = False
 
     '''Get or create a singleton curl_cffi session with Chrome TLS impersonation'''
     @staticmethod
@@ -583,8 +584,16 @@ class RequestWrapper:
             session.cookies.set('CONSENT', 'YES+1', domain='.youtube.com')
             RequestWrapper._curl_session = session
             RequestWrapper._curl_available = True
+            if not RequestWrapper._curl_init_logged:
+                import logging
+                logging.getLogger('vd').warning('[YouTube TLS] curl_cffi session initialized successfully (impersonate=chrome)')
+                RequestWrapper._curl_init_logged = True
             return session
-        except ImportError:
+        except Exception as e:
+            if not RequestWrapper._curl_init_logged:
+                import logging
+                logging.getLogger('vd').warning(f'[YouTube TLS] curl_cffi FAILED to initialize, falling back to urllib (native TLS fingerprint): {e}')
+                RequestWrapper._curl_init_logged = True
             RequestWrapper._curl_available = False
             return None
 

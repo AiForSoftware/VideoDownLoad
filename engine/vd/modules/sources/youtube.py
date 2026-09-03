@@ -28,7 +28,11 @@ class YouTubeVideoClient(BaseVideoClient):
         '''Open the YouTube watch page in a real Chromium browser and extract
         ytInitialPlayerResponse from the page. This bypasses all Innertube
         fingerprint/IP checks because the request comes from a real browser.'''
-        from vd.modules.utils.chromium import DrissionPageUtils
+        try:
+            from vd.modules.utils.chromium import DrissionPageUtils
+        except Exception as err:
+            self.logger_handle.error(f'[DIAG youtube] browser fallback import failed: {err}', disable_print=self.disable_print)
+            return {}
         self.logger_handle.info(f'[DIAG youtube] browser fetch START url={url}', disable_print=self.disable_print)
         page = None
         try:
@@ -36,6 +40,7 @@ class YouTubeVideoClient(BaseVideoClient):
             if not browser_path:
                 self.logger_handle.warning('[DIAG youtube] no system Chrome/Edge found; skipping browser fallback', disable_print=self.disable_print)
                 return {}
+            self.logger_handle.info(f'[DIAG youtube] using browser: {browser_path}', disable_print=self.disable_print)
             page = DrissionPageUtils.initsmartbrowser(
                 headless=True,
                 requests_proxies=self._autosetproxies(),
@@ -60,6 +65,7 @@ class YouTubeVideoClient(BaseVideoClient):
                 ps = data.get('playabilityStatus', {})
                 self.logger_handle.info(f'[DIAG youtube] browser HTML extract playability={ps.get("status")}', disable_print=self.disable_print)
                 return data
+            self.logger_handle.warning('[DIAG youtube] no ytInitialPlayerResponse found in browser page', disable_print=self.disable_print)
         except Exception as err:
             self.logger_handle.error(f'[DIAG youtube] browser fetch failed: {err}', disable_print=self.disable_print)
         finally:
@@ -85,32 +91,44 @@ class YouTubeVideoClient(BaseVideoClient):
             video_info.update(dict(err_msg=f'{self.source}.parsefromurl >>> {url} (Error: could not extract video id)'))
             return [video_info]
         vid = vid_list[0]
-        # try parse with official Innertube API (curl_cffi TLS impersonation)
+        diag_steps = []
+        # Step 1: try Innertube API with curl_cffi TLS impersonation
         raw_data = {}
         try:
             yt = YouTube(video_id=vid)
             raw_data = yt.vid_info
             playability = raw_data.get('playabilityStatus', {})
-            # Default to ERROR if playabilityStatus is missing (e.g. error response)
             status = playability.get('status', 'ERROR')
+            reason = playability.get('reason', '')
             has_streams = bool(raw_data.get('streamingData', {}).get('formats') or raw_data.get('streamingData', {}).get('adaptiveFormats'))
+            diag_steps.append(f'Innertube[{yt.client}]={status}({reason[:30]}) streams={has_streams}')
+            self.logger_handle.info(f'[DIAG youtube] {diag_steps[-1]}', disable_print=self.disable_print)
             if status != 'OK' or not has_streams:
-                # All Innertube clients failed, try browser fallback
-                self.logger_handle.info(f'[DIAG youtube] Innertube blocked ({status}), trying browser fallback', disable_print=self.disable_print)
+                # Step 2: browser fallback
+                self.logger_handle.info('[DIAG youtube] all Innertube clients failed, trying browser fallback', disable_print=self.disable_print)
                 raw_data = self._fetch_via_browser(url, vid)
                 playability = raw_data.get('playabilityStatus', {})
-                status = playability.get('status', 'UNKNOWN')
-                if status != 'OK':
-                    reason = playability.get('reason', 'YouTube requires verification')
-                    raise RuntimeError(f'YouTube blocked all request methods: {status} - {reason}. Try enabling a proxy.')
-            # extract streams
-            stream = yt.streams.gethighestresolution()
-            download_url = stream.url if stream else ''
-            video_info.update(dict(download_url=download_url))
-            # if download_url is empty, try extracting from browser raw_data
+                status = playability.get('status', 'EMPTY')
+                reason = playability.get('reason', '')
+                has_streams = bool(raw_data.get('streamingData', {}).get('formats') or raw_data.get('streamingData', {}).get('adaptiveFormats'))
+                diag_steps.append(f'Browser={status}({reason[:30]}) streams={has_streams}')
+                self.logger_handle.info(f'[DIAG youtube] {diag_steps[-1]}', disable_print=self.disable_print)
+                if status != 'OK' or not has_streams:
+                    diag_summary = ' | '.join(diag_steps)
+                    raise RuntimeError(f'YouTube blocked: {diag_summary}. Enable proxy in Settings or use residential network.')
+            # extract streams: prefer yt.streams (has signature decryption), fallback to raw streamingData
+            download_url = ''
+            try:
+                stream = yt.streams.gethighestresolution()
+                download_url = stream.url if stream else ''
+            except Exception as stream_err:
+                self.logger_handle.warning(f'[DIAG youtube] yt.streams failed: {stream_err}', disable_print=self.disable_print)
             if not download_url and raw_data.get('streamingData'):
                 download_url = self._extract_best_stream(raw_data['streamingData'])
-                video_info.update(dict(download_url=download_url))
+            video_info.update(dict(download_url=download_url))
+            if not download_url:
+                diag_summary = ' | '.join(diag_steps)
+                raise RuntimeError(f'No downloadable stream found ({diag_summary})')
             video_title = legalizestring(raw_data.get('videoDetails', {}).get('title') or yt.title, replace_null_string=null_backup_title).removesuffix('.')
             cover_url = safeextractfromdict(raw_data, ['videoDetails', 'thumbnail', 'thumbnails', -1, 'url'], None)
             video_info.update(dict(title=video_title, save_path=os.path.join(self.work_dir, self.source, f'{video_title}.mp4'), ext='mp4', identifier=vid, cover_url=cover_url))
