@@ -47,9 +47,9 @@ DEFAULT_CLIENTS = {
         'api_key': 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8', 'require_js_player': True, 'require_po_token': True
     },
     'WEB_EMBED': {
-        'innertube_context': {'context': {'client': {'clientName': 'WEB_EMBEDDED_PLAYER', 'osName': 'Windows', 'osVersion': '10.0', 'clientVersion': '2.20240530.02.00', 'clientScreen': 'EMBED'}}},
-        'header': {'User-Agent': 'Mozilla/5.0', 'X-Youtube-Client-Name': '56'},
-        'api_key': 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8', 'require_js_player': True, 'require_po_token': True
+        'innertube_context': {'context': {'client': {'clientName': 'WEB_EMBEDDED_PLAYER', 'osName': 'Windows', 'osVersion': '10.0', 'clientVersion': '2.20251021.01.00', 'clientScreen': 'EMBED'}}},
+        'header': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36', 'X-Youtube-Client-Name': '56', 'X-Youtube-Client-Version': '2.20251021.01.00'},
+        'api_key': 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8', 'require_js_player': True, 'require_po_token': False
     },
     'WEB_MUSIC': {
         'innertube_context': {'context': {'client': {'clientName': 'WEB_REMIX', 'clientVersion': '1.20251013.03.00'}}},
@@ -77,9 +77,9 @@ DEFAULT_CLIENTS = {
         'api_key': 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8', 'require_js_player': True, 'require_po_token': False
     },
     'ANDROID': {
-        'innertube_context': {'context': {'client': {'clientName': 'ANDROID', 'clientVersion': '19.44.38', 'platform': 'MOBILE', 'osName': 'Android', 'osVersion': '14', 'androidSdkVersion': '34'}}},
-        'header': {'User-Agent': 'com.google.android.youtube/', 'X-Youtube-Client-Name': '3'},
-        'api_key': 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8', 'require_js_player': False, 'require_po_token': True
+        'innertube_context': {'context': {'client': {'clientName': 'ANDROID', 'clientVersion': '20.10.38', 'platform': 'MOBILE', 'osName': 'Android', 'osVersion': '14', 'androidSdkVersion': '30'}}},
+        'header': {'User-Agent': 'com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip', 'X-Youtube-Client-Name': '3', 'X-Youtube-Client-Version': '20.10.38'},
+        'api_key': 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8', 'require_js_player': False, 'require_po_token': False
     },
     'ANDROID_VR': {
         'innertube_context': {'context': {'client': {'clientName': 'ANDROID_VR', 'clientVersion': '1.60.19', 'deviceMake': 'Oculus', 'deviceModel': 'Quest 3', 'osName': 'Android', 'osVersion': '12L', 'androidSdkVersion': '32'}}},
@@ -3052,7 +3052,7 @@ class StreamQuery(Sequence):
 
 '''InnerTube'''
 class InnerTube:
-    def __init__(self, client='ANDROID_VR', use_oauth=False, allow_cache=True, token_file=None, oauth_verifier=None, use_po_token=False, po_token_verifier=None):
+    def __init__(self, client='ANDROID', use_oauth=False, allow_cache=True, token_file=None, oauth_verifier=None, use_po_token=False, po_token_verifier=None):
         self.client_name = client
         self.innertube_context = DEFAULT_CLIENTS[client]['innertube_context']
         self.header = DEFAULT_CLIENTS[client]['header']
@@ -3371,7 +3371,7 @@ class YouTube:
         self.embed_url = f"https://www.youtube.com/embed/{self.video_id}"
         self.client = client
         self.client = 'TV' if use_oauth else self.client
-        self.fallback_clients = ['TV', 'IOS']
+        self.fallback_clients = ['WEB_EMBED', 'ANDROID_VR', 'TV', 'IOS']
         self._signature_timestamp: dict = {}
         self._visitor_data = None
         self.stream_monostate = Monostate(on_progress=on_progress_callback, on_complete=on_complete_callback, youtube=self)

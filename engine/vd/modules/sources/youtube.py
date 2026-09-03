@@ -92,13 +92,19 @@ class YouTubeVideoClient(BaseVideoClient):
         if not self.belongto(url=url): return []
         request_overrides, video_info, null_backup_title = request_overrides or {}, VideoInfo(source=self.source), yieldtimerelatedtitle(self.source)
         # try parse with some third part apis
-        for parser in [self._parsefromurlwithytdown, self._parsefromurlwithytdown, self._parsefromurlwithdownr]:
+        for parser in [self._parsefromurlwithytdown, self._parsefromurlwithdownr]:
             video_infos = parser(url, request_overrides)
             if any(video_info.with_valid_download_url for video_info in (video_infos or [])): return video_infos
         # try parse with official apis
         try:
             vid = parse_qs(urlparse(url).query, keep_blank_values=True)['v'][0]
             yt = YouTube(video_id=vid); video_info.update(dict(raw_data=(raw_data := yt.vid_info)))
+            # check playability status before extracting streams
+            playability = raw_data.get('playabilityStatus', {})
+            status = playability.get('status', 'OK')
+            if status != 'OK':
+                reason = playability.get('reason', 'YouTube requires verification for this video')
+                raise RuntimeError(f'YouTube blocked the request: {status} - {reason}. Try enabling a proxy or logging in via OAuth.')
             download_url = yt.streams.gethighestresolution(); video_info.update(dict(download_url=download_url))
             video_title = legalizestring(yt.title, replace_null_string=null_backup_title).removesuffix('.')
             cover_url = safeextractfromdict(raw_data, ['videoDetails', 'thumbnail', 'thumbnails', -1, 'url'], None)
