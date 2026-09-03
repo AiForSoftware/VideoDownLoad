@@ -549,8 +549,12 @@ class _CurlResponseAdapter:
     def __init__(self, resp):
         self._resp = resp
         self._content = None
+        self._read_done = False
     def read(self):
+        # Return full content on first call, then empty bytes (compatible with urllib's read() semantics)
+        if self._read_done: return b''
         if self._content is None: self._content = self._resp.content
+        self._read_done = True
         return self._content
     def info(self):
         return self._resp.headers
@@ -669,9 +673,11 @@ class RequestWrapper:
                 tries += 1
             if file_size == RequestWrapper.default_range_size:
                 try:
-                    content_range = RequestWrapper._executerequest(f"{url}&range=0-99999999999", method="GET", timeout=timeout).info()["Content-Length"]
+                    resp_info = RequestWrapper._executerequest(f"{url}&range=0-99999999999", method="GET", timeout=timeout).info()
+                    # Case-insensitive header lookup (curl_cffi vs urllib may differ)
+                    content_range = resp_info.get("Content-Length") or resp_info.get("content-length")
                     file_size = int(content_range)
-                except (KeyError, IndexError, ValueError) as e:
+                except (KeyError, IndexError, ValueError, TypeError) as e:
                     pass
             while True:
                 try: chunk = resp.read()
