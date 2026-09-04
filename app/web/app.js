@@ -18,6 +18,8 @@ const state = {
     checkedSources: new Set(),
     defaultQuality: 'best',
     logins: {},
+    loginErrors: {},
+    loginSupported: [],
     logsCollapsed: false,
     logFilter: 'all',
     parsing: false,
@@ -28,6 +30,14 @@ const state = {
 const STATUS_TEXT = {
     queued: '排队中', downloading: '下载中', done: '已完成',
     error: '失败', cancelled: '已取消', cancelling: '取消中',
+    paused: '已暂停', pausing: '暂停中', resuming: '恢复中',
+};
+
+const ICONS = {
+    play: '<svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M8 5v14l11-7z"/></svg>',
+    pause: '<svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M6 5h4v14H6zm8 0h4v14h-4z"/></svg>',
+    cancel: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>',
+    folder: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>',
 };
 
 /* ---------------- pywebview bridge ---------------- */
@@ -177,64 +187,24 @@ function updateDownloadBtn() {
 }
 
 function renderProgress() {
-    const box = $('progressList');
-    // Unify every download-kind progress entry into ONE real-time bar.
-    // The original 3 segments (overall videos count + per-video download +
-    // per-ts m3u8 chunks) are folded into a single bar that shows live
-    // bytes / percent / speed / ETA while downloads are running. When no
-    // download is active (queued / completed), the overall videos-count bar
-    // takes over so the area never goes blank — the familiar post-completion
-    // "1 / 1 · 100.0%" state is still visible right after the download
-    // finishes.
-    const downloadTasks = state.progress.filter((p) => (p.kind === 'download' || p.kind === 'm3u8download') && !p.finished);
-    const overallTasks = state.progress.filter((p) => p.kind === 'overall');
+    // 下载详情不再做顶部聚合展示，而是显示在每个单独的下载条目上
+    // （见 renderItemProgress / renderJobs）。
+    $('progressList').innerHTML = '';
+}
 
-    let entry = null;
-    if (downloadTasks.length) {
-        let totalBytes = 0, doneBytes = 0, speedSum = 0;
-        for (const p of downloadTasks) {
-            const t = Number(p.total) || 0;
-            const c = Number(p.completed) || 0;
-            if (t > 0) totalBytes += t;
-            doneBytes += c;
-            speedSum += Number(p.speed) || 0;
-        }
-        const percent = totalBytes > 0 ? Math.min(100, doneBytes / totalBytes * 100) : null;
-        const eta = (speedSum > 0 && totalBytes > doneBytes) ? (totalBytes - doneBytes) / speedSum : null;
-        const desc = downloadTasks.length === 1
-            ? (downloadTasks[0].description || '下载进度')
-            : `下载进度 (${downloadTasks.length} 个并行)`;
-        entry = {
-            kind: 'download',
-            description: desc,
-            completed: doneBytes,
-            total: totalBytes || null,
-            percent: percent,
-            speed: speedSum || null,
-            eta: eta,
-        };
-    } else if (overallTasks.length) {
-        const p = overallTasks[0];
-        entry = {
-            kind: 'overall',
-            description: p.description || '整体进度',
-            completed: p.completed,
-            total: p.total,
-            percent: p.percent,
-            speed: null,
-            eta: null,
-        };
+function renderItemProgress(job, item) {
+    // 把该条目下的所有未完成进度任务（视频流/音频流/分片等）聚合为一条详情：
+    // 已下载 / 总体积 · 百分比 · 速度 · 剩余时间
+    const tasks = state.progress.filter((p) => p.job_id === job.id && p.item_key === item.key && !p.finished);
+    if (!tasks.length) return '';
+    let totalBytes = 0, doneBytes = 0, speedSum = 0, hasTotal = false;
+    for (const p of tasks) {
+        const t = Number(p.total) || 0;
+        const c = Number(p.completed) || 0;
+        if (t > 0) { totalBytes += t; hasTotal = true; }
+        doneBytes += c;
+        speedSum += Number(p.speed) || 0;
     }
-
-    if (!entry) { box.innerHTML = ''; return; }
-
-    const fmtsource = (d) => {
-        const s = String(d || '').trim();
-        if (!s) return '下载进度';
-        if (/^overall(\s+videos)?$/i.test(s)) return '整体进度';
-        if (/^\[bold cyan\]overall videos$/i.test(s)) return '整体进度';
-        return s;
-    };
     const fmteta = (s) => {
         if (s == null) return '';
         if (s < 1) return '即将完成';
@@ -242,88 +212,163 @@ function renderProgress() {
         if (s < 3600) return `剩余 ${Math.floor(s / 60)} 分 ${Math.floor(s % 60)} 秒`;
         return `剩余 ${Math.floor(s / 3600)} 时 ${Math.floor((s % 3600) / 60)} 分`;
     };
-    const percent = (entry.percent == null) ? null : entry.percent;
-    const total = entry.kind === 'download' ? (entry.total ? fmtbytes(entry.total) : null) : entry.total;
-    const done = entry.kind === 'download' ? fmtbytes(entry.completed) : entry.completed;
-    const eta = (percent != null && percent < 100 && entry.eta) ? fmteta(entry.eta) : '';
-    const speedTxt = entry.speed ? fmtspeed(entry.speed) : '';
-    const right = percent == null
-        ? (entry.kind === 'download' ? done : `${entry.completed || 0}`)
-        : `${done} / ${total} · ${percent.toFixed(1)}%${speedTxt ? ' · ' + speedTxt : ''}${eta ? ' · ' + eta : ''}`;
+    const totalTxt = hasTotal ? fmtbytes(totalBytes) : '';
+    const doneTxt = fmtbytes(doneBytes);
+    const percent = hasTotal ? Math.min(100, totalBytes > 0 ? doneBytes / totalBytes * 100 : 0) : null;
+    const eta = (speedSum > 0 && hasTotal && totalBytes > doneBytes) ? (totalBytes - doneBytes) / speedSum : null;
+    const etaTxt = (percent != null && percent < 100 && eta) ? fmteta(eta) : '';
+    const speedTxt = speedSum ? fmtspeed(speedSum) : '';
+    // 阶段标签：让"音频下载 / 合并 / 封装字幕"等无声阶段在进度条上可见，
+    // 避免用户以为视频下完就结束了（实际音频还没下完、或正在 ffmpeg 封装）。
+    const kinds = new Set(tasks.map((p) => p.kind));
+    let phase = '';
+    if (kinds.has('packaging')) phase = '合并/封装';
+    else if (kinds.has('audio')) phase = '音频下载';
+    else if (kinds.has('subtitle')) phase = '字幕下载';
+    let right;
+    if (percent == null) {
+        // 打包/封装阶段没有总量（ffmpeg 不回报进度），显示"处理中…"而非 0 B
+        right = phase ? `${phase} · 处理中…` : doneTxt;
+    } else {
+        right = `${doneTxt} / ${totalTxt} · ${percent.toFixed(1)}%${speedTxt ? ' · ' + speedTxt : ''}${etaTxt ? ' · ' + etaTxt : ''}`;
+        if (phase) right = `${phase} · ${right}`;
+    }
     const fill = percent == null
         ? '<div class="progress-fill unknown"></div>'
         : `<div class="progress-fill" style="width:${percent.toFixed(2)}%"></div>`;
-    const desc = esc(fmtsource(entry.description));
-    const kindTag = entry.kind && entry.kind !== 'overall'
-        ? `<span class="progress-kind">${esc(entry.kind)}</span>` : '';
-    box.innerHTML = `<div class="progress-item" title="${desc}">
-        <div class="progress-top"><b>${desc}</b>${kindTag}<span>${esc(right)}</span></div>
-        <div class="progress-track">${fill}</div>
-    </div>`;
+    // 返回 {text, textHtml, bar, percent}：text 放在标题上方，bar（进度条）留在标题下方
+    return {
+        text: right,
+        textHtml: esc(right),
+        percent: percent,
+        bar: `<div class="item-progress-wrap">
+            <div class="item-progress">
+                <div class="progress-track">${fill}</div>
+            </div>
+        </div>`,
+    };
+}
+
+function jobSnapshot(jobs) {
+    // 仅对影响结构/按钮的状态做快照；进度变化不会触发完整重绘
+    return jobs.map((j) => [
+        j.id, j.status, j.done_count, j.total_count,
+        j.items.map((i) => [i.key, i.status, i.error || '']).join('|'),
+    ].join(':')).join(';');
+}
+
+function updateJobProgress(jobs) {
+    for (const job of jobs) {
+        const jobEl = document.querySelector(`.job[data-job-id="${CSS.escape(job.id)}"]`);
+        if (!jobEl) continue;
+        for (const it of job.items) {
+            const itemEl = jobEl.querySelector(`.job-item[data-item-key="${CSS.escape(it.key)}"]`);
+            if (!itemEl) continue;
+            const shouldShow = it.status === 'downloading' || it.status === 'paused' || it.status === 'pausing';
+            let topEl = itemEl.querySelector('.item-progress-top');
+            let wrapEl = itemEl.querySelector('.item-progress-wrap');
+            if (!shouldShow) {
+                if (topEl) topEl.remove();
+                if (wrapEl) wrapEl.remove();
+                continue;
+            }
+            const prog = renderItemProgress(job, it);
+            if (!prog) {
+                if (topEl) topEl.remove();
+                if (wrapEl) wrapEl.remove();
+                continue;
+            }
+            if (topEl) topEl.textContent = prog.text;
+            else itemEl.insertAdjacentHTML('afterbegin', `<div class="item-progress-top">${prog.textHtml}</div>`);
+            if (wrapEl) {
+                const fill = wrapEl.querySelector('.progress-fill');
+                if (fill) fill.style.width = fill.classList.contains('unknown') ? '35%' : (prog.percent ? prog.percent.toFixed(2) + '%' : '0%');
+            } else {
+                itemEl.insertAdjacentHTML('beforeend', prog.bar);
+            }
+        }
+    }
 }
 
 function renderJobs() {
     const box = $('jobs');
     if (!state.jobs.length) {
         box.innerHTML = '<div class="empty sm"><p>暂无下载任务</p></div>';
+        state._jobSnapshot = '';
         return;
     }
     box.innerHTML = state.jobs.map((job) => {
-        const wholeDone = job.status === 'done';
-        // only show per-item status when it differs from the job-wide status
-        // or when an item errored (then the message carries useful detail).
-        // this prevents "下载中" / "已完成" from appearing twice — once as the
-        // job-level badge in the header and once on every item row.
-        const itemStatuses = job.items.map((it) => it.status);
-        const unique = new Set(itemStatuses);
-        const allSameAsJob = unique.size <= 1 && itemStatuses.every((s) => s === job.status);
-        const hasItemError = itemStatuses.includes('error') || !!job.error;
+        // Compute the effective status each item will display, taking job-wide
+        // transition states into account. We only show per-item badges when the
+        // effective statuses differ from the job status (or an item has an error
+        // detail). This avoids duplicate status badges in the UI.
+        const effectiveStatuses = job.items.map((it) => {
+            let stKey = it.status;
+            if (job.status === 'pausing' && (stKey === 'downloading' || stKey === 'queued')) stKey = 'pausing';
+            if (job.status === 'paused' && (stKey === 'downloading' || stKey === 'queued' || stKey === 'pausing')) stKey = 'paused';
+            if (job.status === 'cancelling' && (stKey === 'downloading' || stKey === 'paused' || stKey === 'queued' || stKey === 'pausing')) stKey = 'cancelling';
+            return stKey;
+        });
+        const unique = new Set(effectiveStatuses);
+        const allSameAsJob = unique.size <= 1 && effectiveStatuses.every((s) => s === job.status);
+        const hasItemError = job.items.some((it) => it.status === 'error') || !!job.error;
         const showItemStatus = !allSameAsJob || hasItemError;
 
-        const items = job.items.map((it) => {
-            let statusHtml = '';
-            if (showItemStatus) {
-                const st = STATUS_TEXT[it.status] || it.status;
-                const errSuffix = it.error ? ' · ' + esc(it.error) : '';
-                statusHtml = `<span class="st ${esc(it.status)}">${esc(st)}${errSuffix}</span>`;
-            }
-            return `<div class="job-item">
-                <span class="name" title="${esc(it.save_path || '')}">${esc(it.title)}</span>
-                ${statusHtml}
+        const items = job.items.map((it, idx) => {
+            // 过渡态跟随任务状态显示，避免"暂停中"徽标和"下载中"条目并存
+            let stKey = effectiveStatuses[idx];
+            const st = STATUS_TEXT[stKey] || stKey;
+            // 错误详情不直接展示在列表里，悬停时通过 title 查看
+            const errTip = it.error ? ` title="${esc(it.error)}"` : '';
+            const statusHtml = showItemStatus
+                ? `<span class="st ${esc(stKey)}"${errTip}>${esc(st)}</span>`
+                : '';
+            const prog = (it.status === 'downloading' || it.status === 'paused' || it.status === 'pausing')
+                ? renderItemProgress(job, it)
+                : null;
+            // 下载详情小字放到条目最上方，进度条留在标题下方
+            return `<div class="job-item" data-item-key="${esc(it.key)}">
+                ${prog ? `<div class="item-progress-top">${prog.textHtml}</div>` : ''}
+                <div class="job-item-main">
+                    <span class="name" title="${esc(it.save_path || '')}">${esc(it.title)}</span>
+                    ${statusHtml}
+                </div>
+                ${prog ? prog.bar : ''}
             </div>`;
         }).join('');
-        const running = job.status === 'downloading' || job.status === 'queued' || job.status === 'cancelling';
-        const action = running
-            ? `<button class="btn ghost sm" data-cancel="${esc(job.id)}">取消</button>`
-            : (job.done_count ? `<button class="btn ghost sm" data-open="${esc(job.id)}">打开目录</button>` : '');
-        // friendly header: time + progress; status badge is hidden when the whole
-        // job is done (dup of the per-item tags) or downloading (the progress bar
-        // already conveys it, and the pill duplicated the per-item "下载中" below)
+
+        // Icon-only action bar. Folder is always available; pause/resume changes
+        // depending on the job state. This stops the folder icon from flashing on/off.
+        const folderBtn = `<button class="icon-btn job-action" data-open="${esc(job.id)}" title="打开文件所在目录">${ICONS.folder}</button>`;
+        let stateBtn = '';
+        if (job.status === 'downloading' || job.status === 'queued' || job.status === 'pausing') {
+            stateBtn = `<button class="icon-btn job-action" data-pause="${esc(job.id)}" title="暂停">${ICONS.pause}</button>`;
+        } else if (job.status === 'paused' || job.status === 'error') {
+            stateBtn = `<button class="icon-btn job-action primary" data-resume="${esc(job.id)}" title="开始/继续">${ICONS.play}</button>`;
+        }
+        // While resuming the backend is reparsing on a background thread; hide the
+        // play button so the user cannot trigger duplicate resume calls.
+        const cancelTitle = ['done', 'error', 'cancelled'].includes(job.status) ? '移除' : '取消';
+        const actions = `${stateBtn}${folderBtn}<button class="icon-btn job-action danger" data-cancel="${esc(job.id)}" title="${esc(cancelTitle)}">${ICONS.cancel}</button>`;
+
         const time = esc(job.finished_at || job.started_at || job.created_at);
-        const headerMeta = `⏱ ${time} · 📦 ${job.done_count}/${job.total_count}`;
+        const remaining = Math.max(0, (job.total_count || 0) - (job.done_count || 0));
+        const headerMeta = `⏱ ${time} · 📦 ${job.done_count || 0}/${job.total_count || 0} 剩 ${remaining}`;
         const badge = (job.status === 'done' || job.status === 'downloading')
             ? ''
             : `<span class="job-status ${esc(job.status)}">${esc(STATUS_TEXT[job.status] || job.status)}</span>`;
-        const idTip = `<span class="job-id-tip" title="任务编号 #${esc(job.id)}">#${esc(job.id)}</span>`;
-        return `<div class="job">
+        return `<div class="job" data-job-id="${esc(job.id)}">
             <div class="job-head">
-                <span class="job-meta">${headerMeta} · ${idTip}</span>
-                ${badge}
+                <span class="job-meta">${headerMeta}</span>
+                <div class="job-head-right">
+                    ${badge}
+                    <span class="job-head-actions">${actions}</span>
+                </div>
             </div>
             <div class="job-items">${items}</div>
-            ${job.error ? `<div class="job-item"><span class="st error">${esc(job.error)}</span></div>` : ''}
-            <div class="job-actions">${action}</div>
         </div>`;
     }).join('');
-    box.querySelectorAll('[data-cancel]').forEach((el) => {
-        el.addEventListener('click', () => { api('cancel', el.getAttribute('data-cancel')); });
-    });
-    box.querySelectorAll('[data-open]').forEach((el) => {
-        el.addEventListener('click', () => {
-            const job = state.jobs.find((j) => j.id === el.getAttribute('data-open'));
-            if (job) api('openpath', job.work_dir);
-        });
-    });
+    state._jobSnapshot = jobSnapshot(state.jobs);
 }
 
 function renderLogs(newLogs) {
@@ -366,11 +411,16 @@ function renderToolChips() {
     }).join('');
 }
 
+function historySnapshot(history) {
+    return history.map((h) => `${h.url}|${h.source || ''}|${h.last_used_at || h.parsed_at || ''}`).join(';');
+}
+
 function renderHistory() {
     const box = $('historyList');
     if (!state.history.length) {
         box.innerHTML = '<div class="empty sm"><p>暂无历史记录，解析过的链接会自动保存到这里</p></div>';
         $('historyCount').textContent = '0';
+        state._historySnapshot = '';
         return;
     }
     $('historyCount').textContent = String(state.history.length);
@@ -392,6 +442,7 @@ function renderHistory() {
             </div>
         </div>`;
     }).join('');
+    state._historySnapshot = historySnapshot(state.history);
 }
 
 function renderEngineChip() {
@@ -444,13 +495,23 @@ function applyState(data) {
     state.engineReady = data.engine_ready;
     state.engineState = data.engine_state || 'unloaded';
     state.engineError = data.engine_error || '';
-    if (data.history) { state.history = data.history; renderHistory(); }
+    if (data.history) {
+        const newSnap = historySnapshot(data.history);
+        if (newSnap !== state._historySnapshot) {
+            state.history = data.history;
+            renderHistory();
+        } else {
+            state.history = data.history;
+        }
+    }
     if (data.logs && data.logs.length) {
         state.logSeq = data.log_seq;
         renderLogs(data.logs);
     }
     renderProgress();
-    renderJobs();
+    const snap = jobSnapshot(state.jobs);
+    if (snap !== state._jobSnapshot) renderJobs();
+    else updateJobProgress(state.jobs);
     renderEngineChip();
     // Force a refresh of the parser list whenever the engine transitions to
     // ready, so the settings whitelist shows every available parser instead of
@@ -531,6 +592,20 @@ function renderSourceGrid() {
     }).join('');
 }
 
+function renderSourceCookies() {
+    const box = $('sourceCookies');
+    const all = state.platforms.concat(state.generic);
+    if (!all.length) { box.innerHTML = '<div class="empty sm"><p>引擎加载后可用</p></div>'; return; }
+    const cookies = (state.config && state.config.per_source_cookies) || {};
+    box.innerHTML = all.map((name) => {
+        const val = esc(cookies[name] || '');
+        return `<label class="source-cookie" title="${esc(name)}">
+            <span>${esc(shortname(name))}</span>
+            <textarea data-source="${esc(name)}" rows="2" spellcheck="false" placeholder="该平台的完整 Cookie 字符串">${val}</textarea>
+        </label>`;
+    }).join('');
+}
+
 /* ---------------- actions ---------------- */
 function applyParseResult(data) {
     const res = (data && data.result) ? data.result : data;
@@ -553,7 +628,7 @@ function applyParseResult(data) {
         toast('解析失败：' + (res.error || '未知错误'), 'err');
     } else if (!state.items.length) {
         $('parseHint').className = 'hint err';
-        $('parseHint').textContent = '未找到可下载的视频，可尝试在设置中填写 Cookie 后重试';
+        $('parseHint').textContent = '未找到可下载的视频，可尝试点击顶栏「登录态」按钮登录该平台后重试';
     } else if (state.items.every((i) => !i.valid)) {
         // Every parsed item has no real download URL (anti-bot / 412 / no cookie).
         // Surface the underlying reason and explicitly suggest a cookie so the
@@ -561,14 +636,14 @@ function applyParseResult(data) {
         const firstErr = (state.items.find((i) => i.err_msg) || {}).err_msg || '所有资源均无有效地址';
         const isAntiBot = /412|403|Precondition|FORBIDDEN|access.denied|Forbidden/i.test(firstErr);
         const isYouTube = /YouTube|youtube/i.test(firstErr);
-        const noCookie = !(state.config && state.config.cookies);
+        const hasAnyLogin = !!(state.config && state.config.per_source_cookies && Object.keys(state.config.per_source_cookies).length);
         $('parseHint').className = 'hint err';
         if (isYouTube) {
             $('parseHint').textContent = '解析失败：YouTube 反爬拦截（IP 被标记）。' + firstErr.slice(0, 200);
-        } else if (isAntiBot && noCookie) {
-            $('parseHint').textContent = '解析失败：网站返回 412/403（反爬限制），所有资源均无有效地址。请打开「设置」粘贴该网站（抖音等）的浏览器 Cookie 后重试。';
+        } else if (isAntiBot && !hasAnyLogin) {
+            $('parseHint').textContent = '解析失败：网站返回 412/403（反爬限制），所有资源均无有效地址。请点击顶栏「登录态」按钮登录该平台（抖音等）后重试。';
         } else if (isAntiBot) {
-            $('parseHint').textContent = '解析失败：网站返回 412/403（反爬），所有资源均无有效地址。当前 Cookie 可能已失效，请更新后重试。';
+            $('parseHint').textContent = '解析失败：网站返回 412/403（反爬），所有资源均无有效地址。当前登录态可能已失效，请点击顶栏「登录态」按钮重新登录后重试。';
         } else {
             $('parseHint').textContent = '解析失败：所有资源均无有效地址（' + firstErr.slice(0, 200) + '）';
         }
@@ -622,6 +697,7 @@ function downloadSelected() {
     if (!keys.length) return;
     api('download', keys, state.config ? state.config.work_dir : null).then((res) => {
         if (!res.ok) toast(res.error || '创建任务失败', 'err');
+        else if (res.count && res.count > 1) toast(`已创建 ${res.count} 个下载任务`);
         else toast(`已创建下载任务 #${res.job_id}`);
     }).catch((err) => toast('创建任务失败：' + err, 'err'));
 }
@@ -631,10 +707,10 @@ function openSettings() {
     const cfg = state.config || {};
     $('cfgWorkDir').value = cfg.work_dir || '';
     $('cfgThreads').value = cfg.num_threadings || 5;
+    $('cfgConcurrent').value = cfg.concurrent_downloads || 2;
     $('cfgProxy').value = cfg.proxy || '';
-    $('cfgCookies').value = cfg.cookies || '';
     $('cfgQuality').value = (cfg.default_quality || 'best');
-    $('cfgCommonOnly').checked = !!cfg.apply_common_clients_only;
+    $('cfgSubtitles').checked = !!(cfg.download_subtitles);
     loadSources();
     $('settingsModal').hidden = false;
 }
@@ -647,6 +723,27 @@ function openLoginModal() {
     closeSettings();
     $('loginModal').hidden = false;
     loadLogins();
+    // The per-source Cookie editor now lives here (not in Settings), so we
+    // make sure the platform list is loaded and (re)render its textareas.
+    if (state.platforms && state.platforms.length) renderSourceCookies();
+    else loadSources().then(() => renderSourceCookies());
+}
+
+function saveCookies() {
+    const map = {};
+    document.querySelectorAll('#sourceCookies textarea[data-source]').forEach((el) => {
+        const v = (el.value || '').trim();
+        if (v) map[el.getAttribute('data-source')] = v;
+    });
+    api('setconfig', { per_source_cookies: map }).then((res) => {
+        if (res && res.ok) {
+            const cfg = state.config || (state.config = {});
+            cfg.per_source_cookies = res.config.per_source_cookies;
+            toast('平台 Cookie 已保存', 'ok');
+        } else {
+            toast('保存失败：' + ((res && res.error) || '未知错误'), 'err');
+        }
+    }).catch((err) => toast('保存失败：' + err, 'err'));
 }
 
 function closeLoginModal() { $('loginModal').hidden = true; }
@@ -656,10 +753,10 @@ function saveSettings() {
     const payload = {
         work_dir: $('cfgWorkDir').value.trim(),
         num_threadings: parseInt($('cfgThreads').value, 10) || 5,
+        concurrent_downloads: parseInt($('cfgConcurrent').value, 10) || 2,
         proxy: $('cfgProxy').value.trim(),
-        cookies: $('cfgCookies').value.trim(),
         default_quality: $('cfgQuality').value,
-        apply_common_clients_only: $('cfgCommonOnly').checked,
+        download_subtitles: $('cfgSubtitles').checked,
         // persist exactly what the user checked. The old "(all checked) -> []"
         // convention silently reset a full whitelist to the 2-platform default
         // on the next launch, and is the reason the whitelist kept "forgetting".
@@ -703,6 +800,7 @@ function bindEvents() {
     $('settingsBtn').addEventListener('click', openSettings);
     $('loginBtn').addEventListener('click', openLoginModal);
     $('closeLoginBtn').addEventListener('click', closeLoginModal);
+    $('saveCookiesBtn').addEventListener('click', saveCookies);
     $('closeSettingsBtn').addEventListener('click', closeSettings);
     $('cancelSettingsBtn').addEventListener('click', closeSettings);
     $('saveSettingsBtn').addEventListener('click', saveSettings);
@@ -732,11 +830,12 @@ function bindEvents() {
         api('clearhistory').then((r) => { state.history = (r && r.history) || []; renderHistory(); });
     });
     $('loginGrid').addEventListener('click', (e) => {
-        const btn = e.target.closest('button[data-login], button[data-finish], button[data-logout]');
+        const btn = e.target.closest('button[data-login], button[data-finish], button[data-logout], button[data-cookie]');
         if (!btn) return;
         if (btn.hasAttribute('data-login')) startLogin(btn.getAttribute('data-login'));
         else if (btn.hasAttribute('data-finish')) finishLogin(btn.getAttribute('data-finish'));
         else if (btn.hasAttribute('data-logout')) logoutSource(btn.getAttribute('data-logout'));
+        else if (btn.hasAttribute('data-cookie')) openCookieSettings(btn.getAttribute('data-cookie'));
     });
     $('historyList').addEventListener('click', (e) => {
         const btn = e.target.closest('button[data-del], button[data-use], button[data-fill]');
@@ -748,6 +847,32 @@ function bindEvents() {
         }
         $('urlInput').value = url;
         if (btn.hasAttribute('data-use')) parseUrl();
+    });
+    // 任务卡片操作按钮使用事件委托，避免轮询重建 DOM 导致按钮闪烁/点击失效
+    $('jobs').addEventListener('click', (e) => {
+        const btn = e.target.closest('button[data-pause], button[data-resume], button[data-cancel], button[data-open]');
+        if (!btn) return;
+        const jobId = btn.getAttribute('data-pause') || btn.getAttribute('data-resume') || btn.getAttribute('data-cancel') || btn.getAttribute('data-open');
+        const job = state.jobs.find((j) => j.id === jobId);
+        if (!job) return;
+        if (btn.hasAttribute('data-pause')) {
+            job.status = 'pausing';
+            renderJobs();
+            api('pause', jobId);
+        } else if (btn.hasAttribute('data-resume')) {
+            job.status = job.status === 'error' ? 'downloading' : 'resuming';
+            renderJobs();
+            api('resume', jobId);
+        } else if (btn.hasAttribute('data-cancel')) {
+            job.status = 'cancelling';
+            renderJobs();
+            api('cancel', jobId);
+        } else if (btn.hasAttribute('data-open')) {
+            const saved = (job.items || []).find((it) => it.save_path);
+            const fallback = (r) => api('openpath', job.work_dir).then((r2) => { if (!r2.ok) toast('打开目录失败：' + (r2.error || r.error || ''), 'err'); });
+            if (saved && saved.save_path) api('revealpath', saved.save_path).then((r) => { if (!r.ok) fallback(r); });
+            else api('openpath', job.work_dir).then((r) => { if (!r.ok) toast('打开目录失败：' + (r.error || ''), 'err'); });
+        }
     });
 }
 
@@ -844,6 +969,7 @@ function renderLoginGrid() {
         const st = (state.logins && state.logins[name]) || 'absent';
         const logged = !!((state.config && state.config.per_source_cookies && state.config.per_source_cookies[name]));
         const err = (state.loginErrors && state.loginErrors[name]) || '';
+        const supported = state.loginSupported == null ? true : state.loginSupported.includes(name);
         let action = '';
         if (st === 'waiting') action = `<button class="btn ghost sm primary-mini" data-finish="${esc(name)}">完成提取</button>`;
         else if (st === 'opening') action = '<span class="tag warn">打开中…</span>';
@@ -851,7 +977,8 @@ function renderLoginGrid() {
         else if (st === 'incomplete') action = `<span class="tag bad">未完成</span><button class="btn ghost sm" data-login="${esc(name)}">重试</button>`;
         else if (st === 'error') action = `<span class="tag bad">失败</span><button class="btn ghost sm" data-login="${esc(name)}">重试</button>`;
         else if (logged) action = `<button class="btn ghost sm danger" data-logout="${esc(name)}">退出</button>`;
-        else action = `<button class="btn ghost sm" data-login="${esc(name)}">登录</button>`;
+        else if (supported) action = `<button class="btn ghost sm" data-login="${esc(name)}">登录</button>`;
+        else action = `<button class="btn ghost sm" data-cookie="${esc(name)}">填写 Cookie</button>`;
         const badge = logged ? '<span class="tag good">已登录</span>' : (st === 'waiting' ? '<span class="tag warn">请登录</span>' : (st === 'incomplete' ? '<span class="tag bad">登录异常</span>' : ''));
         const hint = (st === 'incomplete' || st === 'error') && err ? `<div class="login-hint" style="color:#d9534f;font-size:12px;margin-top:4px;white-space:normal;line-height:1.4;">${esc(err)}</div>` : '';
         return `<div class="login-item" data-source="${esc(name)}">
@@ -869,6 +996,7 @@ function loadLogins() {
         for (const l of (r && r.logins) || []) { logins[l.source] = l.state; if (l.error) errors[l.source] = l.error; }
         state.logins = logins;
         state.loginErrors = errors;
+        state.loginSupported = (r && r.supported) || [];
         if (r && r.per_source_cookies) {
             const cfg = state.config || (state.config = {});
             cfg.per_source_cookies = r.per_source_cookies;
@@ -887,6 +1015,7 @@ function scheduleLoginPoll() {
             for (const l of (r && r.logins) || []) { logins[l.source] = l.state; if (l.error) errors[l.source] = l.error; }
             state.logins = logins;
             state.loginErrors = errors;
+            state.loginSupported = (r && r.supported) || [];
             if (r && r.per_source_cookies) state.config.per_source_cookies = r.per_source_cookies;
             renderLoginGrid();
             const active = (r && r.logins || []).some((l) => ['opening', 'waiting', 'extracting'].includes(l.state));
@@ -894,9 +1023,27 @@ function scheduleLoginPoll() {
         }).catch(() => {});
     }, 1500);
 }
+function openCookieSettings(source) {
+    closeLoginModal();
+    openSettings();
+    // 等设置面板渲染出 Cookie 输入框后再聚焦
+    setTimeout(() => {
+        const el = document.querySelector(`#sourceCookies textarea[data-source="${CSS.escape(source)}"]`);
+        if (el) { el.scrollIntoView({ block: 'center', behavior: 'smooth' }); el.focus(); }
+    }, 50);
+}
+
 function startLogin(source) {
     api('login', source).then((res) => {
-        if (!res || !res.ok) { toast((res && res.error) || '登录启动失败', 'err'); return; }
+        if (!res || !res.ok) {
+            // 不支持自动登录的平台改为引导到设置手动填写，不再显示红色错误提示
+            if (res && res.error && res.error.includes('暂不支持平台')) {
+                openCookieSettings(source);
+                return;
+            }
+            toast((res && res.error) || '登录启动失败', 'err');
+            return;
+        }
         toast('请在弹出的浏览器窗口中登录，完成后点击「完成提取」');
         if (res.hint) toast(res.hint, 'warn');
         loadLogins();

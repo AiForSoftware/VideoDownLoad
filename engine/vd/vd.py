@@ -76,10 +76,10 @@ class VideoClient():
             video_infos = self.parsefromurl(url=user_input)
             self.download(video_infos=video_infos)
     '''parsefromurl'''
-    def parsefromurl(self, url: str) -> list[VideoInfo]:
+    def parsefromurl(self, url: str, skip_web_media_grabber_fallback: bool = False) -> list[VideoInfo]:
         video_infos: list[VideoInfo] = []
         # direct media link
-        if self.web_media_grabber.isprobablydirectmedia(url, self.requests_overrides.get(self.web_media_grabber.source, {}))[0]: return self.web_media_grabber.parsefromurl(url, self.requests_overrides.get(self.web_media_grabber.source, {}))
+        if not skip_web_media_grabber_fallback and self.web_media_grabber.isprobablydirectmedia(url, self.requests_overrides.get(self.web_media_grabber.source, {}))[0]: return self.web_media_grabber.parsefromurl(url, self.requests_overrides.get(self.web_media_grabber.source, {}))
         # platform-specific clients
         if not self.apply_common_video_clients_only:
             for vc_name in list(self.video_clients.keys()):
@@ -103,8 +103,9 @@ class VideoClient():
                     if any(video_info.with_valid_download_url for video_info in (video_infos or [])): break
                 except:
                     video_infos = []
-        # no results found, try web_media_grabber
-        if not video_infos: video_infos = self.web_media_grabber.parsefromurl(url, self.requests_overrides.get(self.web_media_grabber.source, {}))
+        # no results found, try web_media_grabber (unless the caller explicitly asked not to)
+        if not video_infos and not skip_web_media_grabber_fallback:
+            video_infos = self.web_media_grabber.parsefromurl(url, self.requests_overrides.get(self.web_media_grabber.source, {}))
         # return
         return video_infos
     '''download'''

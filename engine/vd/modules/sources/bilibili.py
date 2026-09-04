@@ -179,6 +179,21 @@ class BilibiliVideoClient(BaseVideoClient):
                     _dash = _ddata.get('dash') if isinstance(_ddata, dict) else None
                     _vcount = len(_dash.get('video') or []) if isinstance(_dash, dict) else 0
                     self.logger_handle.info(f'[DIAG bilibili] dash_present={bool(_dash)} dash_video_streams={_vcount}', disable_print=self.disable_print)
+                    # ---- 字幕：来自 playurl 的 subtitle.subtitles（B站专有 JSON，引擎下载时转 VTT 再封装）----
+                    _sub_raw = (isinstance(_ddata, dict) and isinstance(_ddata.get('subtitle'), dict) and _ddata.get('subtitle', {}).get('subtitles')) or []
+                    _bili_subs = []
+                    for _s in _sub_raw:
+                        _u = _s.get('subtitle_url') or ''
+                        if not _u: continue
+                        if _u.startswith('//'): _u = 'https:' + _u
+                        _bili_subs.append({
+                            'lang': str(_s.get('lan') or 'und'),
+                            'url': _u,
+                            'ext': 'json',
+                            'format': 'bilibili_json',
+                            'headers': self.default_download_headers,
+                            'cookies': self.default_download_cookies,
+                        })
                     if isinstance(_dash, dict):
                         _vids = _dash.get('video') or []
                         _auds = _dash.get('audio') or []
@@ -213,6 +228,7 @@ class BilibiliVideoClient(BaseVideoClient):
                                     ext=_ext, guess_video_ext_result=_ext_info,
                                     identifier=f"{video_id}-{extracted_video_item['cid']}-q{_qn}",
                                     cover_url=safeextractfromdict(extracted_video_item, ['first_frame'], None) or safeextractfromdict(raw_data, ['data', 'pic'], None),
+                                    subtitles=_bili_subs,
                                 ))
                                 if _dash_audio_url:
                                     # audio_save_path / audio_ext MUST be set together with
@@ -243,7 +259,8 @@ class BilibiliVideoClient(BaseVideoClient):
                                              save_path=os.path.join(self.work_dir, self.source, f'{_bt}_720P(durl).{_ext}'),
                                              ext=_ext, guess_video_ext_result=_ext_info,
                                              identifier=f"{video_id}-{extracted_video_item['cid']}-durl",
-                                             cover_url=safeextractfromdict(raw_data, ['data', 'pic'], None)))
+                                             cover_url=safeextractfromdict(raw_data, ['data', 'pic'], None),
+                                             subtitles=_bili_subs))
                             video_infos.append(_vpi)
                             progress.advance(1); continue
                     # ---- 回退：durl（fnval=0，无签名）----
@@ -311,6 +328,7 @@ class BilibiliVideoClient(BaseVideoClient):
                             ext=ext, guess_video_ext_result=ext_info,
                             identifier=f"{video_id}-{extracted_video_item['cid']}-q{qn}",
                             cover_url=safeextractfromdict(extracted_video_item, ['first_frame'], None) or safeextractfromdict(prd['x/web-interface/view'], ['data', 'pic'], None),
+                            subtitles=_bili_subs,
                         ))
                         video_infos.append(vpi)
                     progress.advance(1)
@@ -496,6 +514,21 @@ class BilibiliVideoClient(BaseVideoClient):
         if not isinstance(ddata, dict):
             return None
         video_info = VideoInfo(source=self.source)
+        # 字幕：playurl 的 subtitle.subtitles（B站专有 JSON，引擎下载时转 VTT 再封装）
+        _sub_raw = (isinstance(ddata.get('subtitle'), dict) and ddata.get('subtitle', {}).get('subtitles')) or []
+        _bili_subs = []
+        for _s in _sub_raw:
+            _u = _s.get('subtitle_url') or ''
+            if not _u: continue
+            if _u.startswith('//'): _u = 'https:' + _u
+            _bili_subs.append({
+                'lang': str(_s.get('lan') or 'und'),
+                'url': _u,
+                'ext': 'json',
+                'format': 'bilibili_json',
+                'headers': self.default_download_headers,
+                'cookies': self.default_download_cookies,
+            })
         _dash = ddata.get('dash')
         if isinstance(_dash, dict) and _dash.get('video'):
             _vids = [v for v in (_dash.get('video') or []) if isinstance(v, dict) and (v.get('baseUrl') or v.get('base_url'))]
@@ -520,6 +553,7 @@ class BilibiliVideoClient(BaseVideoClient):
                     ext=_ext, guess_video_ext_result=dict(ext=_ext, guessed=True),
                     identifier=f"{video_id}-720p-q{_qn}",
                     cover_url=safeextractfromdict(raw_data, ['data', 'pic'], None) if isinstance(raw_data, dict) else None,
+                    subtitles=_bili_subs,
                 ))
                 if _audio_url:
                     # keep audio_save_path / audio_ext in sync (see the dash-item
@@ -547,6 +581,7 @@ class BilibiliVideoClient(BaseVideoClient):
                     ext=_ext, guess_video_ext_result=dict(ext=_ext, guessed=True),
                     identifier=f"{video_id}-720p-durl",
                     cover_url=safeextractfromdict(raw_data, ['data', 'pic'], None) if isinstance(raw_data, dict) else None,
+                    subtitles=_bili_subs,
                 ))
                 return _vpi
         return None

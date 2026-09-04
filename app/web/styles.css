@@ -273,8 +273,12 @@ body::before {
 .job-status.error { color: var(--err); border-color: rgba(248, 113, 113, .3); }
 .job-status.cancelled, .job-status.cancelling { color: var(--warn); border-color: rgba(251, 191, 36, .3); }
 .job-items { display: flex; flex-direction: column; gap: 5px; }
-.job-item { display: flex; align-items: center; gap: 8px; font-size: 11.5px; }
+.job-item { display: flex; flex-direction: column; gap: 5px; font-size: 11.5px; }
+.job-item-main { display: flex; align-items: center; gap: 8px; }
 .job-item .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: text; }
+.item-progress-wrap { width: 100%; }
+.item-progress-wrap .progress-top { font-size: 10.5px; }
+.item-progress-wrap .progress-track { height: 5px; }
 /* per-item status: same pill look as .job-status so badge & item tags match */
 .job-item .st { flex: none; font-size: 10.5px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); }
 .st.queued { color: var(--muted); }
@@ -282,7 +286,21 @@ body::before {
 .st.done { color: var(--ok); border-color: rgba(52, 211, 153, .3); }
 .st.error { color: var(--err); border-color: rgba(248, 113, 113, .3); }
 .st.cancelled { color: var(--warn); border-color: rgba(251, 191, 36, .3); }
+.job-head-right { display: flex; align-items: center; gap: 8px; flex: none; }
+.job-head-actions { display: flex; gap: 6px; }
 .job-actions { display: flex; gap: 6px; margin-top: 7px; }
+.icon-btn.job-action {
+    width: 28px; height: 28px;
+    border-radius: 8px;
+    background: var(--card);
+    color: var(--muted);
+}
+.icon-btn.job-action svg { width: 14px; height: 14px; }
+.icon-btn.job-action:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+.icon-btn.job-action.primary { color: var(--accent-soft); border-color: rgba(var(--accent-rgb), .45); }
+.icon-btn.job-action.primary:hover:not(:disabled) { background: rgba(var(--accent-rgb), .15); }
+.icon-btn.job-action.danger { color: var(--err); border-color: rgba(248, 113, 113, .3); }
+.icon-btn.job-action.danger:hover:not(:disabled) { background: rgba(248, 113, 113, .12); }
 
 /* ---------- logs ---------- */
 .logs-card { flex: .75; min-height: 0; }
@@ -354,6 +372,11 @@ body::before {
 .source-item { display: flex; align-items: center; gap: 7px; font-size: 11.5px; color: var(--muted); cursor: pointer; }
 .source-item input { accent-color: var(--accent); }
 .source-item:hover { color: var(--text); }
+
+#sourceCookies { max-height: 240px; overflow-y: auto; padding: 9px; border: 1px solid var(--line); border-radius: 10px; background: #0e121b; display: flex; flex-direction: column; gap: 8px; }
+.source-cookie { display: flex; flex-direction: column; gap: 4px; }
+.source-cookie span { font-size: 11px; color: var(--muted); }
+.source-cookie textarea { min-height: 44px; resize: vertical; font-size: 11px; font-family: Consolas, "Courier New", monospace; }
 
 .tools { display: flex; flex-wrap: wrap; gap: 8px; font-size: 11.5px; color: var(--muted); }
 

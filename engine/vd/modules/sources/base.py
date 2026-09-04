@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Mapping, Optional, TYPE_CHECKING
 from rich.progress import Progress, TextColumn, BarColumn, DownloadColumn, TransferSpeedColumn, TimeRemainingColumn, TimeElapsedColumn, ProgressColumn, Task
 from ..utils import touchdir, useparseheaderscookies, usedownloadheaderscookies, usesearchheaderscookies, cookies2dict, generateuniquetmppath, shortenpathsinvideoinfos, optionalimport, optionalimportfrom, cookies2string, safeunlinkpathobj, LoggerHandle, VideoInfo, FileTypeSniffer
-from ..utils.cmd import MergeCCTVTsFilesFFmpegCommand, DownloadFromLocalTxtFileFFmpegCommand, DownloadWithFFmpegCommand, DownloadWithNM3U8DLRECommand, DownloadWithAria2cCommand, MergeVideoAudioAudioTranscodeFFmpegCommand, MergeVideoAudioCopyFFmpegCommand, MergeVideoAudioFullTranscodeFFmpegCommand, RemuxCopyFFmpegCommand
+from ..utils.cmd import MergeCCTVTsFilesFFmpegCommand, DownloadFromLocalTxtFileFFmpegCommand, DownloadWithFFmpegCommand, DownloadWithNM3U8DLRECommand, DownloadWithAria2cCommand, MergeVideoAudioAudioTranscodeFFmpegCommand, MergeVideoAudioCopyFFmpegCommand, MergeVideoAudioFullTranscodeFFmpegCommand, RemuxCopyFFmpegCommand, CommandBuilder
 
 
 '''AutoRegisterMeta'''
@@ -182,20 +182,42 @@ class BaseVideoClient(metaclass=AutoRegisterMeta):
     def _downloadfromyoutube(self, video_info: VideoInfo, video_info_index: int = 0, downloaded_video_infos: list = [], request_overrides: dict = None, progress: Progress | None = None) -> list[VideoInfo]:
         # init
         if not video_info.with_valid_download_url: return downloaded_video_infos
+        # 若成品已存在且大小与流一致，直接跳过，不重复下载（避免二次下载卡住/占用带宽）
+        try:
+            _cl = int(float(video_info.download_url.filesize or 0))
+        except Exception:
+            _cl = 0
+        if _cl > 0 and os.path.isfile(video_info.save_path) and os.path.getsize(video_info.save_path) == _cl:
+            downloaded_video_infos.append(video_info)
+            return downloaded_video_infos
         (video_info := copy.deepcopy(video_info)).save_path = self._ensureuniquefilepath(video_info.save_path)
         request_overrides = dict(request_overrides or {}); touchdir(os.path.dirname(video_info.save_path))
         assert isinstance(video_info.download_url, YouTubeStreamObj)
         # start to download
         try:
             content_length, chunk_size = int(float(video_info.download_url.filesize or 0)), video_info.chunk_size
-            desc_name = f"[{video_info_index+1}] {os.path.basename(video_info.save_path)[:15] + '...'}" if len(os.path.basename(video_info.save_path)) > 15 else f"[{video_info_index+1}] {os.path.basename(video_info.save_path)[:15]}"
+            _base = os.path.basename(video_info.save_path)
+            # The audio stream is saved as `<title>.audio.<ext>`; tag it so the UI
+            # can distinguish "downloading audio" from "downloading video".
+            _is_audio = '.audio.' in _base
+            _prefix = '音频 ' if _is_audio else ''
+            desc_name = f"[{video_info_index+1}] {_prefix}{_base[:15] + '...'}" if len(_base) > 15 else f"[{video_info_index+1}] {_prefix}{_base[:15]}"
             total_bytes, downloaded_bytes = content_length if content_length > 0 else None, 0
-            video_task_id = progress.add_task(desc_name, total=total_bytes, kind="download")
+            video_task_id = progress.add_task(desc_name, total=total_bytes, kind=("audio" if _is_audio else "download")) if progress is not None else None
             with open(video_info.save_path, "wb") as fp:
                 for chunk in video_info.download_url.iterchunks(chunk_size=chunk_size):
-                    if chunk: fp.write(chunk); downloaded_bytes += len(chunk); total_bytes is None and progress.update(video_task_id, total=downloaded_bytes); progress.update(video_task_id, advance=len(chunk))
+                    if chunk: fp.write(chunk); downloaded_bytes += len(chunk)
+                    if progress is not None:
+                        total_bytes is None and progress.update(video_task_id, total=downloaded_bytes)
+                        progress.update(video_task_id, advance=len(chunk))
+            # Remove the completed task so it does not linger at 100% and skew the
+            # item's aggregated progress bar (e.g. while the next phase runs).
+            if progress is not None:
+                progress.remove_task(video_task_id)
             downloaded_video_infos.append(video_info)
         except Exception as err:
+            if type(err).__name__ in ('DownloadPaused', 'DownloadCancelled'):
+                raise
             self.logger_handle.error(f'{self.source}._downloadfromyoutube >>> {video_info.identifier} (Error: {err})', disable_print=self.disable_print)
         # return
         return downloaded_video_infos
@@ -246,6 +268,8 @@ class BaseVideoClient(metaclass=AutoRegisterMeta):
             subprocess.run(remux_copy_cmd, check=True, capture_output=(True if self.disable_print else False), text=True, encoding='utf-8', errors='ignore')
             safeunlinkpathobj(tmp_download_path, max_retries=20, delay=0.2); downloaded_video_infos.append(video_info)
         except Exception as err:
+            if type(err).__name__ in ('DownloadPaused', 'DownloadCancelled'):
+                raise
             self.logger_handle.error(f'{self.source}._downloadfromdailymotion >>> {video_info.download_url} (Error: {err})', disable_print=self.disable_print)
         # return
         return downloaded_video_infos
@@ -353,15 +377,22 @@ class BaseVideoClient(metaclass=AutoRegisterMeta):
             default_download_headers=video_info.default_audio_download_headers, default_download_cookies=video_info.default_audio_download_cookies
         )
         downloaded_audio_infos = self._download(video_info=audio_info, video_info_index=video_info_index, downloaded_video_infos=[], request_overrides=request_overrides, progress=progress)
-        # merge video and audio
+        # merge video and audio. Tracked as a packaging progress task so the UI
+        # does not look frozen while ffmpeg muxes the two streams together.
         audio_save_path, audio_ext, video_save_path, ext = downloaded_audio_infos[0].save_path, downloaded_audio_infos[0].ext, downloaded_video_info[0].save_path, downloaded_video_info[0].ext
-        file_path_for_merge_video_audio = generateuniquetmppath(dir=os.path.join(self.work_dir, self.source), ext=ext)
-        for merge_factory in (MergeVideoAudioAudioTranscodeFFmpegCommand, MergeVideoAudioFullTranscodeFFmpegCommand, MergeVideoAudioCopyFFmpegCommand):
-            cmd = merge_factory().build(video_file_path=video_save_path, audio_file_path=audio_save_path, output_file_path=file_path_for_merge_video_audio, mods=video_info.ffmpeg_settings)
-            try: subprocess.run(cmd, check=True, capture_output=(True if self.disable_print else False), text=True, encoding='utf-8', errors='ignore')
-            except subprocess.CalledProcessError as err: self.logger_handle.error(f'{self.source}._downloadwithnaiveallinone >>> {video_info.download_url} (Error: {err})', disable_print=self.disable_print); continue
-            if MergeVideoAudioCopyFFmpegCommand.hasaudiostream(file_path_for_merge_video_audio) or (not shutil.which('ffprobe')): break
-        shutil.move(file_path_for_merge_video_audio, video_save_path); os.path.exists(audio_save_path) and os.remove(audio_save_path)
+        _short = os.path.basename(video_save_path)[:15]
+        _pkg_task = progress.add_task(f"合并/打包：{_short}", total=None, kind="packaging") if progress is not None else None
+        try:
+            file_path_for_merge_video_audio = generateuniquetmppath(dir=os.path.join(self.work_dir, self.source), ext=ext)
+            for merge_factory in (MergeVideoAudioAudioTranscodeFFmpegCommand, MergeVideoAudioFullTranscodeFFmpegCommand, MergeVideoAudioCopyFFmpegCommand):
+                cmd = merge_factory().build(video_file_path=video_save_path, audio_file_path=audio_save_path, output_file_path=file_path_for_merge_video_audio, mods=video_info.ffmpeg_settings)
+                try: subprocess.run(cmd, check=True, capture_output=(True if self.disable_print else False), text=True, encoding='utf-8', errors='ignore')
+                except subprocess.CalledProcessError as err: self.logger_handle.error(f'{self.source}._downloadwithnaiveallinone >>> {video_info.download_url} (Error: {err})', disable_print=self.disable_print); continue
+                if MergeVideoAudioCopyFFmpegCommand.hasaudiostream(file_path_for_merge_video_audio) or (not shutil.which('ffprobe')): break
+            shutil.move(file_path_for_merge_video_audio, video_save_path); os.path.exists(audio_save_path) and os.remove(audio_save_path)
+        finally:
+            if progress is not None:
+                progress.remove_task(_pkg_task)
         # return
         downloaded_video_info[0].audio_download_url, downloaded_video_info[0].audio_save_path = audio_download_url, audio_save_path
         downloaded_video_info[0].audio_ext, downloaded_video_info[0].guess_audio_ext_result = audio_ext, guess_audio_ext_result
@@ -398,33 +429,211 @@ class BaseVideoClient(metaclass=AutoRegisterMeta):
             return self._downloadfromlocaltxtfilewithffmpeg(video_info=video_info, video_info_index=video_info_index, downloaded_video_infos=downloaded_video_infos, request_overrides=request_overrides, progress=progress)
         # aria2c downloader for speeding up mp4 like files download
         if video_info.download_with_aria2c: return self._downloadwitharia2c(video_info=video_info, video_info_index=video_info_index, downloaded_video_infos=downloaded_video_infos, request_overrides=request_overrides, progress=progress)
-        # naive implementition of file downloader
+        # naive implementition of file downloader with resume support
         (video_info := copy.deepcopy(video_info)).save_path = self._ensureuniquefilepath(video_info.save_path)
         request_overrides = dict(request_overrides or {}); touchdir(os.path.dirname(video_info.save_path))
         if not request_overrides.get('proxies'): request_overrides['proxies'] = self._autosetproxies()
         request_overrides['headers'] = copy.deepcopy(video_info.default_download_headers or request_overrides.get('headers') or self.default_headers or {})
         request_overrides['cookies'] = copy.deepcopy(video_info.default_download_cookies or request_overrides.get('cookies') or self.default_cookies or {})
         try:
-            try: (resp := self.get(video_info.download_url, stream=True, **request_overrides)).raise_for_status()
-            except Exception: (resp := self.get(video_info.download_url, stream=True, verify=False, **request_overrides)).raise_for_status()
+            # Download into a .part file first; if it already exists and the server
+            # supports Range requests, resume from the existing size. This enables
+            # pause/resume in the desktop UI and crash recovery.
+            save_path = video_info.save_path
+            part_path = f'{save_path}.part'
+            start_byte = 0
+            if os.path.exists(part_path):
+                start_byte = os.path.getsize(part_path)
+                if start_byte > 0:
+                    request_overrides['headers']['Range'] = f'bytes={start_byte}-'
+            try:
+                resp = self.get(video_info.download_url, stream=True, **request_overrides)
+                if start_byte > 0 and resp.status_code == 200:
+                    # Server ignored Range; start from scratch.
+                    start_byte = 0
+                    request_overrides['headers'].pop('Range', None)
+                    resp = self.get(video_info.download_url, stream=True, **request_overrides)
+                elif start_byte > 0 and resp.status_code == 416:
+                    # Range not satisfiable: .part is already complete.
+                    os.replace(part_path, save_path)
+                    downloaded_video_infos.append(video_info)
+                    return downloaded_video_infos
+                resp.raise_for_status()
+            except Exception:
+                request_overrides['headers'].pop('Range', None)
+                resp = self.get(video_info.download_url, stream=True, verify=False, **request_overrides)
+                resp.raise_for_status()
             content_length, chunk_size = int(float(resp.headers.get("Content-Length", 0) or 0)), video_info.chunk_size
             desc_name = f"[{video_info_index+1}] {os.path.basename(video_info.save_path)[:15] + '...'}" if len(os.path.basename(video_info.save_path)) > 15 else f"[{video_info_index+1}] {os.path.basename(video_info.save_path)[:15]}"
-            total_bytes, downloaded_bytes = content_length if content_length > 0 else None, 0
-            video_task_id = progress.add_task(desc_name, total=total_bytes, kind="download")
-            with open(video_info.save_path, "wb") as fp:
+            if start_byte > 0 and resp.status_code == 206 and content_length > 0:
+                total_bytes = start_byte + content_length
+            elif content_length > 0:
+                total_bytes = content_length
+            else:
+                total_bytes = None
+            downloaded_bytes = start_byte
+            video_task_id = progress.add_task(desc_name, total=total_bytes, completed=start_byte, kind="download")
+            mode = "ab" if start_byte > 0 else "wb"
+            with open(part_path, mode) as fp:
                 for chunk in resp.iter_content(chunk_size=chunk_size):
-                    if chunk: fp.write(chunk); downloaded_bytes += len(chunk); total_bytes is None and progress.update(video_task_id, total=downloaded_bytes); progress.update(video_task_id, advance=len(chunk))
+                    if chunk:
+                        fp.write(chunk)
+                        downloaded_bytes += len(chunk)
+                        total_bytes is None and progress.update(video_task_id, total=downloaded_bytes)
+                        progress.update(video_task_id, advance=len(chunk))
+            os.replace(part_path, save_path)
             downloaded_video_infos.append(video_info)
         except Exception as err:
+            # User pause/cancel are control flows, not download failures.
+            if type(err).__name__ in ('DownloadPaused', 'DownloadCancelled'):
+                raise
             self.logger_handle.error(f'{self.source}._download >>> {video_info.download_url} (Error: {err})', disable_print=self.disable_print)
         # return
         return downloaded_video_infos
+    '''_collect_subtitle_sources'''
+    def _collect_subtitle_sources(self, video_info: VideoInfo, request_overrides: dict = None) -> list:
+        # Build a deduplicated list of subtitle descriptors:
+        #   {lang, url, ext, headers, cookies}
+        # Sources: (1) explicitly set by a parser via video_info.subtitles, and
+        # (2) automatically derived from HLS playlists (m3u8/m3u) so any HLS
+        # source gets subtitles without per-parser wiring.
+        subs = []
+        for s in (video_info.get('subtitles') or []):
+            if isinstance(s, dict) and s.get('url'):
+                subs.append({
+                    'lang': str(s.get('lang') or 'und'),
+                    'url': str(s['url']),
+                    'ext': str(s.get('ext') or 'vtt').lstrip('.').lower() or 'vtt',
+                    'headers': s.get('headers') or {},
+                    'cookies': s.get('cookies') or {},
+                })
+        if not subs and isinstance(video_info.download_url, str):
+            ext = os.path.splitext(video_info.download_url)[1].lstrip('.').lower()
+            if ext in ('m3u8', 'm3u'):
+                try:
+                    from ..utils.hls import TencentHLSHelper
+                    _, hls_subs = TencentHLSHelper.naiveparsem3u8formats(video_info.download_url)
+                    for lang, items in (hls_subs or {}).items():
+                        for it in items:
+                            if it.get('url'):
+                                subs.append({'lang': str(lang), 'url': str(it['url']), 'ext': str(it.get('ext') or 'vtt').lstrip('.').lower() or 'vtt', 'headers': {}, 'cookies': {}})
+                except Exception as err:
+                    self.logger_handle.warning(f'{self.source}._collect_subtitle_sources >>> HLS subtitle parse failed (Error: {err})', disable_print=self.disable_print)
+        seen, out = set(), []
+        for s in subs:
+            key = (s['lang'], s['url'])
+            if key in seen: continue
+            seen.add(key); out.append(s)
+        return out
+
+    '''_bilibili_json_to_vtt'''
+    @staticmethod
+    def _bilibili_json_to_vtt(data: dict) -> str:
+        # B站 subtitle_url 返回的是专有 JSON（body 为 [{from,to,content,...}]），
+        # 不是标准字幕格式，需在下载时转成 VTT 才能被 ffmpeg 封装。
+        def _ts(t):
+            t = float(t or 0)
+            ms = int(round((t - int(t)) * 1000))
+            h, m, s = int(t // 3600), int((t % 3600) // 60), int(t % 60)
+            return f'{h:02d}:{m:02d}:{s:02d}.{ms:03d}'
+        lines = ['WEBVTT', '']
+        for seg in (data.get('body') or []):
+            lines.append(f'{_ts(seg.get("from"))} --> {_ts(seg.get("to"))}')
+            lines.append(str(seg.get('content') or '').replace('\\n', '\n'))
+            lines.append('')
+        return '\n'.join(lines)
+
+    '''_download_subtitle_file'''
+    def _download_subtitle_file(self, sub: dict, work_dir: str, request_overrides: dict = None):
+        try:
+            headers = copy.deepcopy(sub.get('headers') or {})
+            cookies = copy.deepcopy(sub.get('cookies') or {})
+            if cookies: headers['cookie' if 'cookie' in headers else 'Cookie'] = cookies2string(cookies)
+            ro = dict(request_overrides or {})
+            ro['headers'] = headers
+            resp = self.get(sub['url'], stream=True, **ro)
+            resp.raise_for_status()
+            # B站专有 JSON 字幕：下载后转 VTT 再保存。
+            if sub.get('format') == 'bilibili_json':
+                import json as _json
+                try:
+                    data = _json.loads(resp.text)
+                except Exception:
+                    data = _json.loads(resp.content.decode('utf-8', errors='ignore'))
+                vtt = self._bilibili_json_to_vtt(data)
+                tmp = generateuniquetmppath(dir=work_dir, ext='vtt')
+                with open(tmp, 'w', encoding='utf-8') as fp:
+                    fp.write(vtt)
+                return (sub['lang'], tmp)
+            tmp = generateuniquetmppath(dir=work_dir, ext=sub['ext'] or 'vtt')
+            with open(tmp, 'wb') as fp:
+                for chunk in resp.iter_content(chunk_size=64 * 1024):
+                    if chunk: fp.write(chunk)
+            return (sub['lang'], tmp)
+        except Exception as err:
+            self.logger_handle.error(f'{self.source}._download_subtitle_file >>> {sub.get("url")} (Error: {err})', disable_print=self.disable_print)
+            return None
+
+    '''_mux_subtitles_if_any'''
+    def _mux_subtitles_if_any(self, video_info: VideoInfo, request_overrides: dict = None, progress: Progress | None = None) -> None:
+        save_path = video_info.get('save_path') or ''
+        if not save_path or not os.path.exists(save_path): return
+        subs = self._collect_subtitle_sources(video_info, request_overrides)
+        if not subs: return
+        work_dir = os.path.dirname(save_path) or '.'
+        # Download subtitle files, tracked so the user can see this phase in the
+        # progress bar instead of thinking the app froze after the video finished.
+        _sub_task = progress.add_task(f"下载字幕：{os.path.basename(save_path)[:15]}", total=len(subs), kind="subtitle") if progress is not None else None
+        downloaded = []
+        for sub in subs:
+            res = self._download_subtitle_file(sub, work_dir, request_overrides)
+            if res: downloaded.append(res)
+            if progress is not None:
+                progress.update(_sub_task, advance=1)
+        if progress is not None:
+            progress.remove_task(_sub_task)
+        if not downloaded:
+            return
+        ffmpeg = shutil.which('ffmpeg')
+        if not ffmpeg:
+            self.logger_handle.warning(f'{self.source}._mux_subtitles >>> ffmpeg not found, subtitles skipped', disable_print=self.disable_print)
+            for _, p in downloaded: safeunlinkpathobj(p)
+            return
+        out_ext = os.path.splitext(save_path)[1].lstrip('.').lower() or 'mkv'
+        out = generateuniquetmppath(dir=work_dir, ext=out_ext)
+        builder = CommandBuilder(ffmpeg).flag('-y')
+        builder.positional(save_path)
+        for _, p in downloaded: builder.positional(p)
+        builder.add('-map', '0')
+        for i in range(len(downloaded)):
+            builder.add('-map', str(i + 1))
+        builder.add('-c', 'copy')
+        for i, (lang, _) in enumerate(downloaded):
+            builder.add(f'-metadata:s:s:{i}', f'language={lang}')
+        builder.positional(out)
+        # Mux the subtitles into the final video, tracked as a packaging phase.
+        _mux_task = progress.add_task(f"封装字幕：{os.path.basename(save_path)[:15]}", total=None, kind="packaging") if progress is not None else None
+        try:
+            subprocess.run(builder.tolist(), check=True, capture_output=(True if self.disable_print else False), text=True, encoding='utf-8', errors='ignore')
+            shutil.move(out, save_path)
+        except subprocess.CalledProcessError as err:
+            self.logger_handle.error(f'{self.source}._mux_subtitles >>> {save_path} (Error: {err})', disable_print=self.disable_print)
+            os.path.exists(out) and os.remove(out)
+        finally:
+            if progress is not None:
+                progress.remove_task(_mux_task)
+            for _, p in downloaded: safeunlinkpathobj(p)
+
     '''download'''
     @usedownloadheaderscookies
     def download(self, video_infos: list[VideoInfo], num_threadings: int = 5, request_overrides: dict = None) -> list[VideoInfo]:
         # init
         if not (video_infos := [video_info for video_info in video_infos if video_info.with_valid_download_url]): return []
-        request_overrides, downloaded_video_infos = dict(request_overrides or {}), []
+        request_overrides = dict(request_overrides or {})
+        # The desktop passes the user's "download subtitles" preference through
+        # request_overrides; pop it so it never reaches the network layer.
+        download_subtitles = bool(request_overrides.pop('download_subtitles', True))
+        downloaded_video_infos = []
         video_infos = shortenpathsinvideoinfos(video_infos, key='save_path'); video_infos = shortenpathsinvideoinfos(video_infos, key='audio_save_path')
         # logging
         self.logger_handle.info(f'Start to download videos using {self.source}.', disable_print=self.disable_print)
@@ -434,6 +643,16 @@ class BaseVideoClient(metaclass=AutoRegisterMeta):
             with ThreadPoolExecutor(max_workers=num_threadings) as executor:
                 futures = [executor.submit(self._download, video_info, vid, downloaded_video_infos, request_overrides, progress) for vid, video_info in enumerate(video_infos)]
                 for fut in as_completed(futures): fut.result(); progress.update(overall_task_id, advance=1)
+            # The overall counter is only meaningful in the CLI console. In the
+            # desktop UI it would otherwise attach to a single item and pollute
+            # that item's aggregated progress bar (skewing it to 100% before the
+            # merge/subtitle phases finish), so drop it here.
+            progress.remove_task(overall_task_id)
+        # download subtitles (if any) and mux them into the final videos
+        if download_subtitles:
+            for dvi in downloaded_video_infos:
+                try: self._mux_subtitles_if_any(dvi, request_overrides, progress)
+                except Exception as err: self.logger_handle.error(f'{self.source}._mux_subtitles >>> {getattr(dvi, "save_path", "")} (Error: {err})', disable_print=self.disable_print)
         # logging
         self.logger_handle.info(f'Finished downloading videos from {self.source}. Valid downloads: {len(downloaded_video_infos)}.', disable_print=self.disable_print)
         # return

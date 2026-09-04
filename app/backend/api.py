@@ -41,11 +41,13 @@ class JsApi():
             'config': {
                 'work_dir': self.service.config.work_dir,
                 'num_threadings': self.service.config.num_threadings,
+                'concurrent_downloads': self.service.config.concurrent_downloads,
                 'proxy': self.service.config.proxy,
                 'cookies': self.service.config.cookies,
                 'per_source_cookies': self.service.config.per_source_cookies,
                 'default_quality': self.service.config.default_quality,
                 'apply_common_clients_only': self.service.config.apply_common_clients_only,
+                'download_subtitles': self.service.config.download_subtitles,
                 'allowed_sources': self.service.config.allowed_sources,
                 'last_url': self.service.config.last_url,
             },
@@ -124,6 +126,11 @@ class JsApi():
                 cfg.num_threadings = max(1, min(32, int(config['num_threadings'])))
             except Exception:
                 pass
+        if 'concurrent_downloads' in config:
+            try:
+                cfg.concurrent_downloads = max(1, min(16, int(config['concurrent_downloads'])))
+            except Exception:
+                pass
         if 'proxy' in config:
             cfg.proxy = str(config['proxy'] or '').strip()
         if 'cookies' in config:
@@ -134,6 +141,8 @@ class JsApi():
             cfg.default_quality = str(config['default_quality'] or 'best').strip().lower() or 'best'
         if 'apply_common_clients_only' in config:
             cfg.apply_common_clients_only = bool(config['apply_common_clients_only'])
+        if 'download_subtitles' in config:
+            cfg.download_subtitles = bool(config['download_subtitles'])
         if 'allowed_sources' in config:
             value = config['allowed_sources']
             cfg.allowed_sources = list(value) if isinstance(value, (list, tuple)) else []
@@ -225,11 +234,27 @@ class JsApi():
     def download(self, keys: List[str] = None, work_dir: str = None) -> Dict[str, Any]:
         return self.service.enqueue(list(keys or []), work_dir)
 
+    def pause(self, job_id: str) -> Dict[str, Any]:
+        return self.service.pause(job_id)
+
+    def resume(self, job_id: str) -> Dict[str, Any]:
+        return self.service.resume(job_id)
+
     def cancel(self, job_id: str) -> Dict[str, Any]:
         return self.service.cancel(job_id)
 
     def clearjobs(self) -> Dict[str, Any]:
         return self.service.clearjobs()
+
+    def shutdown(self) -> Dict[str, Any]:
+        '''Cancel all downloads and kill child processes. Invoked when the UI
+        window is closed so the app does not leave orphaned ffmpeg/aria2c/node
+        or WebView2 processes running in the background.'''
+        try:
+            self.service.shutdown()
+        except Exception as err:
+            diag.log('api', f'shutdown failed: {err}', 'warning')
+        return {'ok': True}
 
     def state(self, after_seq: int = 0) -> Dict[str, Any]:
         try:
@@ -265,10 +290,11 @@ class JsApi():
 
     def login_status(self) -> Dict[str, Any]:
         '''Return the live login state of every source seen so far.'''
-        from .login import login_manager
+        from .login import login_manager, LOGIN_URLS
         return {
             'logins': login_manager.status(),
             'per_source_cookies': dict(self.service.config.per_source_cookies or {}),
+            'supported': list(LOGIN_URLS.keys()),
         }
 
     def logout(self, source: str = '') -> Dict[str, Any]:
@@ -282,6 +308,10 @@ class JsApi():
 
     def openpath(self, path: str) -> Dict[str, Any]:
         return VideoDlService.openpath(path)
+
+    def revealpath(self, path: str) -> Dict[str, Any]:
+        '''打开文件所在目录并选中该文件。'''
+        return VideoDlService.revealpath(path)
 
     def openurl(self, url: str) -> Dict[str, Any]:
         return VideoDlService.openurl(url)

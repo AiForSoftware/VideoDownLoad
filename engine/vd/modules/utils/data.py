@@ -45,10 +45,13 @@ class VideoInfo(MutableMapping):
     aria2c_settings: Dict[str, Any] | Callable[..., Any] | tuple[Any, ...] = field(default_factory=dict)
     # unique id
     identifier: str = ""
+    # subtitles: list of {lang, url, ext, headers, cookies}. When populated,
+    # the downloader fetches each track and muxes it into the final video.
+    subtitles: list = field(default_factory=list)
     # filed names
     _field_names: ClassVar[tuple[str, ...]] = (
         "source", "raw_data", "title", "cover_url", "err_msg", "download_url", "default_download_headers", "default_download_cookies", "audio_download_url", "default_audio_download_headers", "default_audio_download_cookies", "ext", "save_path", 
-        "guess_video_ext_result", "audio_ext", "audio_save_path", "guess_audio_ext_result", "download_with_ffmpeg", "ffmpeg_settings", "enable_nm3u8dlre", "nm3u8dlre_settings", "download_with_aria2c", "aria2c_settings", "identifier",
+        "guess_video_ext_result", "audio_ext", "audio_save_path", "guess_audio_ext_result", "download_with_ffmpeg", "ffmpeg_settings", "enable_nm3u8dlre", "nm3u8dlre_settings", "download_with_aria2c", "aria2c_settings", "identifier", "subtitles",
     )
     # with valid video download url
     @property

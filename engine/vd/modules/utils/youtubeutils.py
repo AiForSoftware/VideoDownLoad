@@ -10,6 +10,7 @@ import math
 import enum
 import json
 import time
+import threading
 import shutil
 import struct
 import base64
@@ -75,6 +76,16 @@ DEFAULT_CLIENTS = {
         'innertube_context': {'context': {'client': {'clientName': 'WEB_KIDS', 'osName': 'Windows', 'osVersion': '10.0', 'clientVersion': '2.20241125.00.00', 'platform': 'DESKTOP'}}},
         'header': {'User-Agent': 'Mozilla/5.0', 'X-Youtube-Client-Name': '76', 'X-Youtube-Client-Version': '2.20241125.00.00'},
         'api_key': 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8', 'require_js_player': True, 'require_po_token': False
+    },
+    # VISIONOS: the Apple Vision Pro player client. Its (deliberately old)
+    # clientVersion keeps it OUT of the GVS poToken policy, so it is the only
+    # client that still returns the FULL adaptive ladder (4K/1440P/1080P) with
+    # plain https urls and no poToken — verified live. Learned from yt-dlp,
+    # which uses it as its default (js-less) client.
+    'VISIONOS': {
+        'innertube_context': {'context': {'client': {'clientName': 'VISIONOS', 'clientVersion': '1.02', 'deviceMake': 'Apple', 'deviceModel': 'RealityDevice17,1', 'userAgent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15', 'osName': 'visionOS', 'osVersion': '26.5.23O471'}}},
+        'header': {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15', 'X-Youtube-Client-Name': '101', 'X-Youtube-Client-Version': '1.02'},
+        'api_key': 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8', 'require_js_player': False, 'require_po_token': False
     },
     'ANDROID': {
         'innertube_context': {'context': {'client': {'clientName': 'ANDROID', 'clientVersion': '20.10.38', 'platform': 'MOBILE', 'osName': 'Android', 'osVersion': '14', 'androidSdkVersion': '30', 'hl': 'en', 'gl': 'US'}}},
@@ -567,23 +578,41 @@ class _CurlResponseAdapter:
 '''RequestWrapper - uses curl_cffi for TLS fingerprint impersonation'''
 class RequestWrapper:
     default_range_size = 9437184
-    _curl_session = None
+    # Parallel (multi-connection) download tuning for a single YouTube stream.
+    # Splitting one file across several byte-range connections can multiply
+    # throughput when the bottleneck is per-connection rate (the "推流速度"
+    # ceiling) rather than total bandwidth. These are intentionally modest to
+    # avoid tripping YouTube's per-IP connection heuristics.
+    parallel_segment_size = 8 * 1024 * 1024   # target bytes per parallel connection
+    parallel_connections = 8                  # hard cap on simultaneous connections
+    _thread_local = None                      # thread-local curl sessions (set lazily)
     _curl_available = None
     _curl_init_logged = False
 
-    '''Get or create a singleton curl_cffi session with Chrome TLS impersonation'''
+    '''Lazily create the thread-local storage for per-thread curl sessions.'''
+    @staticmethod
+    def _tls():
+        if RequestWrapper._thread_local is None:
+            RequestWrapper._thread_local = threading.local()
+        return RequestWrapper._thread_local
+
+    '''Get or create a per-thread curl_cffi session with Chrome TLS impersonation.
+    A separate session per thread (instead of one shared singleton) keeps the
+    parallel range downloads thread-safe.'''
     @staticmethod
     def _get_curl_session():
-        if RequestWrapper._curl_available is False: return None
-        if RequestWrapper._curl_session is not None: return RequestWrapper._curl_session
+        local = RequestWrapper._tls()
+        if getattr(local, 'curl_available', None) is False: return None
+        sess = getattr(local, 'curl_session', None)
+        if sess is not None: return sess
         try:
             from curl_cffi import requests as curl_requests
             session = curl_requests.Session(impersonate='chrome')
             # Set YouTube consent cookies to bypass consent wall
             session.cookies.set('SOCS', 'CAISAQAD', domain='.youtube.com')
             session.cookies.set('CONSENT', 'YES+1', domain='.youtube.com')
-            RequestWrapper._curl_session = session
-            RequestWrapper._curl_available = True
+            local.curl_session = session
+            local.curl_available = True
             if not RequestWrapper._curl_init_logged:
                 import logging
                 logging.getLogger('vd').warning('[YouTube TLS] curl_cffi session initialized successfully (impersonate=chrome)')
@@ -594,13 +623,15 @@ class RequestWrapper:
                 import logging
                 logging.getLogger('vd').warning(f'[YouTube TLS] curl_cffi FAILED to initialize, falling back to urllib (native TLS fingerprint): {e}')
                 RequestWrapper._curl_init_logged = True
-            RequestWrapper._curl_available = False
+            local.curl_available = False
             return None
 
-    '''Reset the curl_cffi session to clear poisoned cookies (call when LOGIN_REQUIRED)'''
+    '''Reset the curl_cffi session(s) to clear poisoned cookies (call when LOGIN_REQUIRED)'''
     @staticmethod
     def reset_curl_session():
-        RequestWrapper._curl_session = None
+        local = RequestWrapper._tls()
+        local.curl_session = None
+        local.curl_available = None
 
     '''_executerequest'''
     @staticmethod
@@ -649,7 +680,7 @@ class RequestWrapper:
         querys['sq'] = 0
         url = base_url + parse.urlencode(querys)
         segment_data = b''
-        for chunk in RequestWrapper.stream(url, timeout=timeout, max_retries=max_retries):
+        for chunk in RequestWrapper._stream_sequential(url, timeout=timeout, max_retries=max_retries):
             yield chunk
             segment_data += chunk
         stream_info = segment_data.split(b'\r\n')
@@ -661,16 +692,43 @@ class RequestWrapper:
         while seq_num <= segment_count:
             querys['sq'] = seq_num
             url = base_url + parse.urlencode(querys)
-            yield from RequestWrapper.stream(url, timeout=timeout, max_retries=max_retries)
+            yield from RequestWrapper._stream_sequential(url, timeout=timeout, max_retries=max_retries)
             seq_num += 1
         return
-    '''stream'''
+    '''_fetch_range: download a single [start, stop] byte range into memory.
+    Retries on transient errors and short reads; returns the exact bytes.
+    `allow_partial` (used for the final segment) accepts a short read, since
+    some servers clamp an over-long range to EOF instead of returning 416.'''
     @staticmethod
-    def stream(url, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, max_retries=0):
+    def _fetch_range(url, start, stop, timeout, max_retries, allow_partial=False):
+        expected = stop - start + 1
+        tries = 0
+        last_err = None
+        while tries <= max_retries:
+            try:
+                resp = RequestWrapper._executerequest(f"{url}&range={start}-{stop}", method="GET", timeout=timeout)
+                data = resp.read()
+                if data is None: data = b''
+                if len(data) == expected or (allow_partial and len(data) <= expected):
+                    return data
+                last_err = f'range {start}-{stop} returned {len(data)} bytes, expected {expected}'
+            except (URLError, http.client.IncompleteRead, OSError) as e:
+                last_err = e
+            except Exception as e:
+                last_err = e
+            tries += 1
+        raise Exception(f'failed to download byte range {start}-{stop}: {last_err}')
+
+    '''_stream_sequential: original single-connection streaming downloader.
+    Used as a fallback when the total size is unknown (so we cannot split into
+    parallel ranges) and by seqstream().'''
+    @staticmethod
+    def _stream_sequential(url, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, max_retries=0):
         downloaded = 0
-        file_size: int = RequestWrapper.default_range_size
-        while downloaded < file_size:
-            stop_pos, tries = min(downloaded + RequestWrapper.default_range_size, file_size) - 1, 0
+        chunk_size = RequestWrapper.default_range_size
+        while True:
+            stop_pos, tries = downloaded + chunk_size - 1, 0
+            resp = None
             while True:
                 if tries >= 1 + max_retries: raise HTTPError()
                 try:
@@ -680,21 +738,95 @@ class RequestWrapper:
                 except http.client.IncompleteRead: pass
                 else: break
                 tries += 1
-            if file_size == RequestWrapper.default_range_size:
-                try:
-                    resp_info = RequestWrapper._executerequest(f"{url}&range=0-99999999999", method="GET", timeout=timeout).info()
-                    # Case-insensitive header lookup (curl_cffi vs urllib may differ)
-                    content_range = resp_info.get("Content-Length") or resp_info.get("content-length")
-                    file_size = int(content_range)
-                except (KeyError, IndexError, ValueError, TypeError) as e:
-                    pass
-            while True:
-                try: chunk = resp.read()
-                except StopIteration: return
-                except http.client.IncompleteRead as e: chunk = e.partial
-                if not chunk: break
-                if chunk: downloaded += len(chunk)
-                yield chunk
+            # Read this range's body. A 416 (range beyond the end of the file)
+            # yields no data, and a completed file yields a final short chunk.
+            got = 0
+            try:
+                while True:
+                    try: chunk = resp.read()
+                    except StopIteration: break
+                    except http.client.IncompleteRead as e: chunk = e.partial
+                    if not chunk: break
+                    got += len(chunk)
+                    yield chunk
+            except Exception:
+                # Any read error (incl. a 416 on some backends) ends the stream.
+                pass
+            downloaded += got
+            # Empty response or a short final chunk => we reached the end of the
+            # file. Stop here instead of looping forever on a bogus file size.
+            if got < chunk_size:
+                break
+        return
+
+    '''stream: download a YouTube media url, yielding chunks in order.
+    When the total size is known (passed via total_size, or discovered via a
+    HEAD request), split the file across several concurrent byte-range
+    connections (see parallel_connections) to raise throughput; otherwise fall
+    back to the sequential single-connection downloader.'''
+    @staticmethod
+    def stream(url, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, max_retries=0, total_size=None):
+        total = total_size
+        if not total or total <= 0:
+            try:
+                total = RequestWrapper.filesize(url)
+            except Exception:
+                total = None
+        if not total or total <= 0:
+            yield from RequestWrapper._stream_sequential(url, timeout, max_retries)
+            return
+        import logging
+        seg_size = RequestWrapper.parallel_segment_size
+        seg_count = max(1, min(RequestWrapper.parallel_connections, math.ceil(total / seg_size)))
+        chunk_size = RequestWrapper.default_range_size
+        logging.getLogger('vd').info(
+            f'[YouTube DL] parallel download: total={total} bytes, segments={seg_count}, seg_size={seg_size}')
+        segments = []
+        pos = 0
+        for i in range(seg_count):
+            end = total - 1 if i == seg_count - 1 else pos + seg_size - 1
+            segments.append((pos, end))
+            pos = end + 1
+        seg_size = RequestWrapper.parallel_segment_size
+        seg_count = max(1, min(RequestWrapper.parallel_connections, math.ceil(total / seg_size)))
+        chunk_size = RequestWrapper.default_range_size
+        segments = []
+        pos = 0
+        for i in range(seg_count):
+            end = total - 1 if i == seg_count - 1 else pos + seg_size - 1
+            segments.append((pos, end))
+            pos = end + 1
+        buffers = {}
+        errors = []
+        next_idx = 0
+        lock = threading.Lock()
+        def worker(idx, start, stop):
+            try:
+                data = RequestWrapper._fetch_range(url, start, stop, timeout, max_retries, allow_partial=(idx == len(segments) - 1))
+                with lock:
+                    buffers[idx] = data
+            except Exception as e:
+                with lock:
+                    if not errors:
+                        errors.append(e)
+        threads = [threading.Thread(target=worker, args=(i, s, e), daemon=True) for i, (s, e) in enumerate(segments)]
+        for t in threads: t.start()
+        try:
+            while next_idx < len(segments):
+                with lock:
+                    err = errors[0] if errors else None
+                    buf = None if err is not None else buffers.pop(next_idx, None)
+                if err is not None:
+                    for t in threads: t.join()
+                    raise err
+                if buf is None:
+                    time.sleep(0.005)
+                    continue
+                for off in range(0, len(buf), chunk_size):
+                    yield buf[off:off + chunk_size]
+                next_idx += 1
+        finally:
+            for t in threads: t.join()
         return
     '''filesize'''
     @staticmethod
@@ -1194,8 +1326,9 @@ class Stream:
     def iterchunks(self, chunk_size: Optional[int] = None):
         bytes_remaining = self.filesize
         if chunk_size: RequestWrapper.default_range_size = chunk_size
+        total = self._filesize if self._filesize else self.filesize
         try:
-            stream = RequestWrapper.stream(self.url)
+            stream = RequestWrapper.stream(self.url, total_size=total)
         except HTTPError as e:
             if e.code != 404: raise Exception
             stream = RequestWrapper.seqstream(self.url)
@@ -3541,13 +3674,17 @@ class YouTube:
         stream_manifest = applydescrambler(self.streaming_data)
         inner_tube = InnerTube(self.client)
         if self.po_token: applypotoken(stream_manifest, self.vid_info, self.po_token)
-        if inner_tube.require_js_player:
-            try:
-                applysignature(stream_manifest, self.vid_info, self.js, self.js_url)
-            except:
-                self._js = None
-                self._js_url = None
-                applysignature(stream_manifest, self.vid_info, self.js, self.js_url)
+        # ALWAYS run applysignature: since 2024 googlevideo rejects every stream
+        # url whose `n` parameter has not been transformed by the player JS
+        # (403 text/plain), INCLUDING the plain-url ANDROID/IOS clients
+        # (require_js_player=False). The `sig` part is only applied when an `s`
+        # cipher exists, so plain-url manifests just get their `n` fixed here.
+        try:
+            applysignature(stream_manifest, self.vid_info, self.js, self.js_url)
+        except Exception:
+            self._js = None
+            self._js_url = None
+            applysignature(stream_manifest, self.vid_info, self.js, self.js_url)
         for stream in stream_manifest:
             video = Stream(stream=stream, monostate=self.stream_monostate, po_token=self.po_token, video_playback_ustreamer_config=self.video_playback_ustreamer_config)
             self._fmt_streams.append(video)

@@ -126,16 +126,16 @@
                 </div>
             </label>
             <label class="field">
-                <span>并发线程数</span>
+                <span>单任务线程数</span>
                 <input id="cfgThreads" type="number" min="1" max="32" />
+            </label>
+            <label class="field">
+                <span>同时下载数</span>
+                <input id="cfgConcurrent" type="number" min="1" max="16" />
             </label>
             <label class="field">
                 <span>代理（可选，例如 127.0.0.1:7890）</span>
                 <input id="cfgProxy" type="text" spellcheck="false" placeholder="留空则不使用代理" />
-            </label>
-            <label class="field">
-                <span>Cookie（可选，用于需要登录的平台）</span>
-                <textarea id="cfgCookies" rows="3" spellcheck="false" placeholder="name=value; name2=value2"></textarea>
             </label>
             <label class="field">
                 <span>默认画质（解析后默认选中的清晰度）</span>
@@ -149,9 +149,9 @@
                     <option value="auto">由解析结果决定（全选）</option>
                 </select>
             </label>
-            <label class="field checkbox">
-                <input id="cfgCommonOnly" type="checkbox" />
-                <span>仅使用通用解析器（相当于命令行 -g，解析速度更快）</span>
+            <label class="field checkbox-field">
+                <input id="cfgSubtitles" type="checkbox" />
+                <span>下载字幕并封装进视频（HLS 自动提取字幕轨，部分平台需解析器支持）</span>
             </label>
             <div class="field">
                 <span>平台白名单（勾选即启用；默认仅启用 抖音 + 哔哩哔哩）</span>
@@ -179,6 +179,14 @@
         <div class="modal-body">
             <p class="hint" style="margin:0 0 10px;">点击「登录」后会弹出浏览器窗口，扫码/账号登录即可自动保存 Cookie；已登录的平台在解析/下载时会自动带上登录态。</p>
             <div class="login-grid" id="loginGrid"><div class="empty sm"><p>引擎加载后可用</p></div></div>
+            <div class="field" id="cookieEditorField" style="margin-top:16px;">
+                <span>平台 Cookie（不支持自动登录的平台可在此手动填写完整 Cookie 字符串）</span>
+                <div id="sourceCookies"><div class="empty sm"><p>引擎加载后可用</p></div></div>
+            </div>
+        </div>
+        <div class="modal-foot">
+            <div class="spacer"></div>
+            <button class="btn primary" id="saveCookiesBtn">保存 Cookie</button>
         </div>
     </div>
 </div>

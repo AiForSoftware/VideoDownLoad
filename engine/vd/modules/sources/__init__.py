@@ -21,34 +21,14 @@ from .base import BaseVideoClient
 from ..utils import BaseModuleBuilder
 
 
+# This project has VERIFIED and maintains exactly three platform parsers
+# (see docs/视频解析器构建流程.md): douyin / bilibili / youtube. All other
+# upstream platform parsers have been REMOVED — do not re-add them blindly,
+# they are unverified and some carry privacy/risk issues (see LLM_BUILD_GUIDE.md §9).
 _EAGER_PARSERS = [
-    ('iyf', 'IYFVideoClient'), ('abc', 'ABCVideoClient'), ('wwe', 'WWEVideoClient'),
-    ('ted', 'TedVideoClient'), ('ku6', 'Ku6VideoClient'), ('c56', 'C56VideoClient'),
-    ('ccc', 'CCCVideoClient'), ('pear', 'PearVideoClient'), ('huya', 'HuyaVideoClient'),
-    ('sina', 'SinaVideoClient'), ('base', 'BaseVideoClient'), ('mgtv', 'MGTVVideoClient'),
-    ('cctv', 'CCTVVideoClient'), ('sohu', 'SohuVideoClient'), ('nuvid', 'NuVidVideoClient'),
-    ('tbnuk', 'TBNUKVideoClient'), ('unity', 'UnityVideoClient'), ('acfun', 'AcFunVideoClient'),
-    ('xigua', 'XiguaVideoClient'), ('pipix', 'PipixVideoClient'), ('oasis', 'OasisVideoClient'),
-    ('weibo', 'WeiboVideoClient'), ('zhihu', 'ZhihuVideoClient'), ('kakao', 'KakaoVideoClient'),
-    ('youku', 'YoukuVideoClient'), ('m1905', 'M1905VideoClient'), ('iqiyi', 'IQiyiVideoClient'),
-    ('leshi', 'LeshiVideoClient'), ('rutube', 'RutubeVideoClient'), ('youtube', 'YouTubeVideoClient'),
-    ('artetv', 'ArteTVVideoClient'), ('sixroom', 'SixRoomVideoClient'), ('foxnews', 'FoxNewsVideoClient'),
-    ('meipai', 'MeipaiVideoClient'), ('genius', 'GeniusVideoClient'),
-    ('haokan', 'HaokanVideoClient'), ('douyin', 'DouyinVideoClient'), ('kugoumv', 'KugouMVVideoClient'),
-    ('open163', 'Open163VideoClient'), ('reddit', 'RedditVideoClient'), ('rednote', 'RednoteVideoClient'),
-    ('pipigaoxiao', 'PipigaoxiaoVideoClient'), ('wesing', 'WeSingVideoClient'), ('weishi', 'WeishiVideoClient'),
-    ('tencent', 'TencentVideoClient'), ('xuexicn', 'XuexiCNVideoClient'), ('huanqiu', 'HuanQiuVideoClient'),
-    ('mingpao', 'MingpaoVideoClient'), ('cctvnews', 'CCTVNewsVideoClient'),
-    ('kuaishou', 'KuaishouVideoClient'), ('bilibili', 'BilibiliVideoClient'),
-    ('myvideoge', 'MyVideoGeVideoClient'), ('newspicks', 'NewsPicksVideoClient'),
-    ('xinhuanet', 'XinhuaNetVideoClient'), ('yinyuetai', 'YinyuetaiVideoClient'),
-    ('duxiaoshi', 'DuxiaoshiVideoClient'), ('dongchedi', 'DongchediVideoClient'),
-    ('kankannews', 'KanKanNewsVideoClient'), ('baidutieba', 'BaiduTiebaVideoClient'),
-    ('eyepetizer', 'EyepetizerVideoClient'), ('chinadaily', 'ChinaDailyVideoClient'),
-    ('dailymotion', 'DailyMotionVideoClient'), ('xinpianchang', 'XinpianchangVideoClient'),
-    ('orientaldaily', 'OrientalDailyVideoClient'), ('beacon', 'BeaconVideoClient'),
-    ('cctalk', 'CCtalkVideoClient'), ('people', 'PeopleVideoClient'),
-    ('www163', 'WWW163VideoClient'), ('zuiyou', 'ZuiyouVideoClient'),
+    ('douyin', 'DouyinVideoClient'),
+    ('bilibili', 'BilibiliVideoClient'),
+    ('youtube', 'YouTubeVideoClient'),
 ]
 
 

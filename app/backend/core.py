@@ -3,13 +3,14 @@ Function:
     Desktop backend core service
     - lazily imports the vd engine (it is heavy: 60+ platform parsers)
     - keeps the original `VideoInfo` objects alive so that no download capability is lost
-    - runs downloads in a background worker and exposes plain dicts to the webview frontend
+    - runs downloads in a background thread pool and exposes plain dicts to the webview frontend
 Author:
     CodeBuddy
 '''
 from __future__ import annotations
 
 import os
+import pickle
 import re
 import sys
 import json
@@ -21,14 +22,15 @@ import subprocess
 import time
 import importlib
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, Future, CancelledError
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 from urllib.parse import urlsplit
 
 from . import diag
-from .progress import ProgressBus, install_progress_hook, DownloadCancelled
+from .progress import ProgressBus, install_progress_hook, DownloadCancelled, DownloadPaused
 
 # Enable the lazy-parser mode we wired into the vendored vd upstream.
 # Each `vd.modules.sources.<x>` parser is imported on first need, and its
@@ -42,6 +44,25 @@ os.environ.setdefault('VD_LAZY_PARSERS', '1')
 # (ffmpeg merging video+audio, N_m3u8DL-RE, aria2c, node) still pops up its own
 # black console window. Patch subprocess.Popen once, process-wide, so any child
 # spawned without explicit flags gets CREATE_NO_WINDOW — no more console flashes.
+#
+# The same patch also tracks every child we spawn so we can forcefully kill them
+# all on shutdown — otherwise ffmpeg/aria2c/node orphaned by a cancelled download
+# (or a window that was closed mid-flight) keep running in the background after
+# the app "exits". See `VideoDlService.shutdown()`.
+_SUBPROCESS_REGISTRY: list = []  # live Popen objects spawned by this process
+
+
+def _kill_tracked_subprocesses() -> None:
+    '''Terminate every child process we have spawned (ffmpeg/aria2c/node/...).'''
+    for proc in list(_SUBPROCESS_REGISTRY):
+        try:
+            if proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
+    _SUBPROCESS_REGISTRY.clear()
+
+
 if os.name == 'nt':
     import subprocess as _subprocess
     _CREATE_NO_WINDOW = 0x08000000
@@ -50,8 +71,10 @@ if os.name == 'nt':
     def _no_window_popen_init(self, *args, **kwargs):
         kwargs.setdefault('creationflags', _CREATE_NO_WINDOW)
         _orig_popen_init(self, *args, **kwargs)
+        _SUBPROCESS_REGISTRY.append(self)
 
     _subprocess.Popen.__init__ = _no_window_popen_init
+
 
 
 '''paths'''
@@ -75,13 +98,17 @@ def defaultworkdir() -> str:
 # parse is fast (no 60+ parser modules imported up front). Users opt into more
 # platforms from the Settings panel — each is lazy-loaded on first use.
 # WebMediaGrabber always stays available as the universal fallback.
-DEFAULT_ALLOWED_SOURCES = ['DouyinVideoClient', 'BilibiliVideoClient']
+# Only the three VERIFIED platform parsers ship enabled by default
+# (douyin / bilibili / youtube — see docs/视频解析器构建流程.md). All other
+# upstream platform parsers have been removed from the engine entirely.
+DEFAULT_ALLOWED_SOURCES = ['DouyinVideoClient', 'BilibiliVideoClient', 'YouTubeVideoClient']
 
 
 @dataclass
 class Config():
     work_dir: str = field(default_factory=defaultworkdir)
     num_threadings: int = 5
+    concurrent_downloads: int = 2
     proxy: str = ''
     cookies: str = ''
     # per-source login cookies captured via the in-app login window (DrissionPage).
@@ -91,6 +118,8 @@ class Config():
     # 'best' | '4k' | '1080p' | '720p' | '480p' | '360p' | 'auto'
     default_quality: str = 'best'
     apply_common_clients_only: bool = False
+    # Download subtitles (when available) and mux them into the final video.
+    download_subtitles: bool = True
     # Default whitelist: only 抖音 + bilibili load by default. Other platforms are
     # available on demand from Settings → check the ones you need. This keeps the
     # first launch fast; the lazy-import machinery (VD_LAZY_PARSERS=1) means
@@ -109,6 +138,11 @@ class Config():
             path = Path.home() / '.vd-desktop'
         path.mkdir(parents=True, exist_ok=True)
         return path / 'config.json'
+
+    @staticmethod
+    def jobspath() -> Path:
+        '''Path to the persisted job store (lives next to config.json).'''
+        return Config.configpath().parent / 'jobs.json'
 
     '''load'''
 
@@ -151,6 +185,9 @@ class Config():
             # the settings dialog with dozens of checkboxes.
             if 'allowed_sources' not in known or not known['allowed_sources']:
                 known['allowed_sources'] = list(DEFAULT_ALLOWED_SOURCES)
+            # Backwards compatibility: old configs used num_threadings for concurrency.
+            if 'concurrent_downloads' not in known:
+                known['concurrent_downloads'] = max(1, int(known.get('num_threadings', 2) or 2))
             return cls(**known)
         except Exception:
             return cls()
@@ -231,7 +268,7 @@ class UiLogHandler(logging.Handler):
         super(UiLogHandler, self).__init__(level=logging.DEBUG)
         self.sink = sink
 
-    def emit(self, record: logging.LogRecord) -> None:
+    def emit(self, record: LogRecord) -> None:
         try:
             self.sink(record.levelname.lower(), record.getMessage())
         except Exception:
@@ -247,18 +284,30 @@ class VideoDlService():
         with diag.step('core', 'load config'):
             self.config = Config.load()
         self.bus = ProgressBus.instance()
-        diag.log('core', f'config loaded: work_dir={self.config.work_dir!r} threadings={self.config.num_threadings} common_only={self.config.apply_common_clients_only}')
+        diag.log('core', f'config loaded: work_dir={self.config.work_dir!r} concurrent={self.config.concurrent_downloads} threadings={self.config.num_threadings}')
         # logs
         self._log_lock = threading.Lock()
         self._log_seq = 0
         self._logs: deque = deque(maxlen=800)
         # parsed videos (keep the original VideoInfo objects in memory)
         self._parsed: Dict[str, Any] = {}
+        # key -> source url that produced the VideoInfo (needed to re-parse on
+        # resume-after-restart, since VideoInfo objects cannot be serialized).
+        self._parsed_url: Dict[str, str] = {}
         self._parsed_lock = threading.Lock()
         # jobs
         self._jobs_lock = threading.RLock()
         self._jobs: Dict[str, Dict[str, Any]] = {}
-        self._queue: 'queue.Queue[str]' = queue.Queue()
+        # concurrent download executor: one thread per active item, up to
+        # concurrent_downloads items at the same time.
+        self._executor: Optional[ThreadPoolExecutor] = None
+        self._executor_lock = threading.Lock()
+        self._futures: Dict[Future, tuple] = {}
+        self._futures_lock = threading.Lock()
+        self._inflight: Set[tuple] = set()
+        self._inflight_lock = threading.Lock()
+        self._job_clients: Dict[str, Any] = {}
+        self._job_clients_lock = threading.Lock()
         # parse history (persisted across launches)
         self.history: List[Dict[str, Any]] = HistoryStore.load()
         # engine (loaded lazily: only when the first parse is requested)
@@ -270,19 +319,37 @@ class VideoDlService():
         self._client = None
         self._client_signature: Optional[tuple] = None
         self._client_lock = threading.Lock()
-        # the VideoClient built for the currently-running download job (set by
-        # `_runjob`, cleared in its `finally`). `_sourceclient` reuses it so
-        # the `allowed` restriction is honoured and we don't rebuild with the
-        # full registered-modules list. Only accessed from the worker thread.
-        self._active_client = None
         self.source_names: List[str] = []
         self.common_source_names: List[str] = []
-        # worker
-        self._worker = threading.Thread(target=self._workerloop, name='vd-download-worker', daemon=True)
-        self._worker.start()
         self._poll_count = 0
-        diag.log('core', 'download worker thread started')
+        diag.log('core', 'VideoDlService initialized')
         self.log('info', 'desktop backend is ready, waiting for the vd engine to be loaded')
+        # Restore previously persisted jobs. Unfinished jobs come back as PAUSED
+        # (shown but not started); the user starts them via the per-job
+        # "开始/继续" button, which re-parses and resumes. See `_load_jobs`.
+        self._load_jobs()
+        # Restore parsed VideoInfo cache only for the jobs that survived the
+        # restart filter, then immediately prune stale entries from disk.
+        self._load_parsed_cache()
+        self._save_parsed_cache()
+
+    @property
+    def _effective_concurrent(self) -> int:
+        return max(1, int(self.config.concurrent_downloads or self.config.num_threadings or 2))
+
+    def _ensure_executor(self) -> None:
+        '''Recreate the thread pool whenever the concurrency setting changes.'''
+        wanted = self._effective_concurrent
+        with self._executor_lock:
+            if self._executor is not None and self._executor._max_workers == wanted:
+                return
+            if self._executor is not None:
+                try:
+                    self._executor.shutdown(wait=False)
+                except Exception:
+                    pass
+            self._executor = ThreadPoolExecutor(max_workers=wanted, thread_name_prefix='vd-item')
+            diag.log('core', f'download executor resized to {wanted} worker(s)')
 
     '''-------------------- logging --------------------'''
 
@@ -400,14 +467,18 @@ class VideoDlService():
     def _humanize_error(self, after_seq: int) -> str:
         '''Turn the engine error logs captured during a download into a user-facing reason.'''
         errs = [l['message'] for l in self.logs(after_seq) if l['level'] == 'error']
+        # 去掉我们自己写的日志前缀（如 "[jobid] download error: "），避免内部日志直接暴露给用户
+        errs = [re.sub(r'^\[[^\]]+\]\s*(?:download error:\s*)?', '', e) for e in errs]
         if not errs:
             return '下载失败：未获取到有效下载地址（链接可能已失效，或源站需要登录/代理）'
         last = errs[-1]
         m = last.lower()
+        if 'list index out of range' in m or 'index out of range' in m:
+            return '下载失败：未能解析到可用的视频流地址，请重新解析链接后重试。'
         if '403' in last:
-            return '下载失败：源站拒绝访问(403)，可能链接过期、需要登录 Cookie 或被风控；可在设置中填写 Cookie/代理后重试。'
+            return '下载失败：源站拒绝访问(403)，可能链接过期、需要登录或被风控；请点击顶栏「登录态」按钮登录后重试。'
         if '412' in last:
-            return '下载失败：被源站风控拦截(412)，请稍后重试，或在设置中填写浏览器 Cookie。'
+            return '下载失败：被源站风控拦截(412)，请稍后重试，或点击顶栏「登录态」按钮登录该平台。'
         if '404' in last:
             return '下载失败：资源不存在(404)，视频可能已被删除或链接无效。'
         if 'timed out' in m or 'timeout' in m:
@@ -592,18 +663,16 @@ class VideoDlService():
             diag.log('core', f'  lazy-load {full_name} failed: {type(err).__name__}: {err}')
             return False
 
-    def _sourceclient(self, source: str):
-        '''Return the (lazily instantiated) per-platform client that owns this source.'''
-        # reuse the job-scoped client if one is active (so we honour the
-        # `allowed` restriction built by `_runjob`); otherwise fall back to
-        # a full-rebuild client. Always accessed from the worker thread, so
-        # the `_active_client` read is single-threaded by construction.
-        client = self._active_client or self._buildclient()
-        if client is None:
+    def _sourceclient(self, source: str, client=None):
+        '''Return the (lazily instantiated) per-platform client that owns this source.
+        If a job-scoped client is provided, use it; otherwise fall back to the
+        global cached client.'''
+        target_client = client or self._buildclient()
+        if target_client is None:
             return None
-        if source == getattr(client.web_media_grabber, 'source', 'WebMediaGrabber'):
-            return client.web_media_grabber
-        for container, builder in ((client.video_clients, self.BuildVideoClient), (client.common_video_clients, self.BuildCommonVideoClient)):
+        if source == getattr(target_client.web_media_grabber, 'source', 'WebMediaGrabber'):
+            return target_client.web_media_grabber
+        for container, builder in ((target_client.video_clients, self.BuildVideoClient), (target_client.common_video_clients, self.BuildCommonVideoClient)):
             entry = container.get(source)
             if entry is None:
                 continue
@@ -613,19 +682,22 @@ class VideoDlService():
             return entry
         return None
 
-    def downloadvideoinfo(self, video_info) -> list:
+    def downloadvideoinfo(self, video_info, client=None) -> list:
         '''
         Download one VideoInfo through its own client.
         NOTE: `vd.vd.VideoClient.download` collects the results but never returns them
         (upstream bug), so we call the per-source client directly to get a reliable result.
         '''
         source = str(getattr(video_info, 'source', '') or '')
-        target = self._sourceclient(source)
+        target = self._sourceclient(source, client)
         if target is None:
             raise RuntimeError(f'no video client is available for source: {source}')
-        client = self._client
-        overrides = (getattr(client, 'requests_overrides', {}) or {}).get(source, {})
-        return target.download([video_info], num_threadings=max(1, int(self.config.num_threadings or 1)), request_overrides=overrides) or []
+        target_client = client or self._client
+        overrides = dict((getattr(target_client, 'requests_overrides', {}) or {}).get(source, {}))
+        # Propagate the user's "download subtitles" preference to the engine.
+        # The engine pops this key before it reaches the network layer.
+        overrides['download_subtitles'] = bool(self.config.download_subtitles)
+        return target.download([video_info], num_threadings=1, request_overrides=overrides) or []
 
     def prewarm(self) -> None:
         '''Lazily start the engine load in the background (no startup cost).'''
@@ -731,6 +803,9 @@ class VideoDlService():
         key = uuid.uuid4().hex
         with self._parsed_lock:
             self._parsed[key] = video_info
+            # remember which url produced this item so a post-restart resume can
+            # re-parse it (VideoInfo objects are not serializable).
+            self._parsed_url[key] = self.config.last_url
         title = ''
         save_path = ''
         ext = ''
@@ -768,6 +843,35 @@ class VideoDlService():
             'download_url': download_url[:600], 'err_msg': str(getattr(video_info, 'err_msg', '') or ''),
         }
 
+    def _subtask_count_for(self, video_info) -> int:
+        '''How many trackable sub-tasks a VideoInfo represents.
+
+        A typical YouTube item has separate video + audio streams plus optional
+        subtitle tracks. Counting these instead of whole items lets the UI say
+        "2/3 done, 1 remaining" while an item is still in progress.'''
+        count = 0
+        try:
+            if video_info.with_valid_download_url:
+                count += 1
+            if video_info.with_valid_audio_download_url:
+                count += 1
+            count += len(getattr(video_info, 'subtitles', None) or [])
+        except Exception:
+            pass
+        return max(count, 1)
+
+    def _identifier_for(self, video_info) -> str:
+        '''Best-effort stable identifier for matching a restored item to a
+        freshly parsed one. YouTube sets ``identifier`` to ``vid-label``; for
+        other sources we fall back to the raw ``identifier`` field.'''
+        try:
+            identifier = str(getattr(video_info, 'identifier', '') or '')
+            if identifier:
+                return identifier
+        except Exception:
+            pass
+        return ''
+
     '''-------------------- download --------------------'''
 
     def enqueue(self, keys: List[str], work_dir: Optional[str] = None) -> Dict[str, Any]:
@@ -777,9 +881,8 @@ class VideoDlService():
         # synchronous `_buildclient(force=True)` blocks the bridge for several
         # seconds, freezes the "下载选中" button and makes it appear completely
         # unresponsive. The download worker thread builds its own job-scoped
-        # client in `_runjob` and reads `self.config.*` live, so any
-        # work_dir / proxy / cookies change saved by the GUI is honoured by
-        # the worker without us pre-building on the bridge thread.
+        # client in `_process_item` and reads `self.config.*` live, so any
+        # work_dir / proxy / cookies change saved by the GUI is honoured.
         if work_dir and work_dir.strip():
             new_wd = work_dir.strip()
             if new_wd != self.config.work_dir:
@@ -789,140 +892,703 @@ class VideoDlService():
             valid_keys = [k for k in keys if k in self._parsed]
         if not valid_keys:
             return {'ok': False, 'error': 'no valid media selected'}
-        job_id = uuid.uuid4().hex[:12]
-        items = []
+        self._ensure_executor()
+        job_ids: List[str] = []
         for key in valid_keys:
+            job_id = uuid.uuid4().hex[:12]
             with self._parsed_lock:
                 video_info = self._parsed[key]
-            items.append({
+                url_for_item = self._parsed_url.get(key)
+            source = str(getattr(video_info, 'source', '') or '')
+            sources_needed: List[str] = []
+            if source and source != 'WebMediaGrabber':
+                sources_needed.append(source)
+            sub_count = self._subtask_count_for(video_info)
+            identifier = self._identifier_for(video_info)
+            item = {
                 'key': key, 'title': str(getattr(video_info, 'title', '') or Path(str(getattr(video_info, 'save_path', '') or '')).name or 'untitled'),
                 'save_path': str(getattr(video_info, 'save_path', '') or ''), 'status': 'queued', 'error': '',
-            })
-        job = {
-            'id': job_id, 'items': items, 'status': 'queued', 'error': '', 'created_at': datetime.now().strftime('%H:%M:%S'),
-            'started_at': '', 'finished_at': '', 'work_dir': self.config.work_dir, 'cancel_event': threading.Event(),
-            'done_count': 0, 'total_count': len(items), 'url': self.config.last_url,
-        }
+                'subtask_count': sub_count, 'identifier': identifier,
+            }
+            job = {
+                'id': job_id, 'items': [item], 'status': 'queued', 'error': '', 'created_at': datetime.now().strftime('%H:%M:%S'),
+                'started_at': '', 'finished_at': '', 'work_dir': self.config.work_dir,
+                'cancel_event': threading.Event(), 'pause_event': threading.Event(),
+                'done_count': 0, 'total_count': sub_count, 'url': self.config.last_url,
+                'urls': [url_for_item] if url_for_item else [], 'sources_needed': sources_needed, 'restored': False,
+            }
+            with self._jobs_lock:
+                self._jobs[job_id] = job
+            job_ids.append(job_id)
+            future = self._executor.submit(self._process_item, job_id, key)
+            with self._futures_lock:
+                self._futures[future] = (job_id, key)
+            future.add_done_callback(self._on_item_done)
+        self._save_jobs()
+        self._save_parsed_cache()
+        self.log('info', f'enqueued {len(job_ids)} job(s): {job_ids}, concurrency={self._effective_concurrent}')
+        return {'ok': True, 'job_id': job_ids[0], 'job_ids': job_ids, 'count': len(job_ids)}
+
+    def _getjob(self, job_id: str):
         with self._jobs_lock:
-            self._jobs[job_id] = job
-        self._queue.put(job_id)
-        self.log('info', f'job {job_id} queued: {len(items)} item(s)')
-        return {'ok': True, 'job_id': job_id}
+            return self._jobs.get(job_id)
+
+    def _get_or_build_job_client(self, job_id: str, source: str):
+        '''Return a job-scoped VideoClient, building it once per job on first use.'''
+        with self._job_clients_lock:
+            client = self._job_clients.get(job_id)
+            if client is not None:
+                return client
+        job = self._getjob(job_id)
+        # Build outside the lock to avoid holding it during the heavy import.
+        # Prefer the pre-computed list of all sources needed by this job so a
+        # multi-source job shares one client instead of rebuilding per item.
+        sources_needed = (job.get('sources_needed') if job else None) or ([source] if source and source != 'WebMediaGrabber' else None)
+        client = self._buildclient(allowed=sources_needed or None)
+        if client is None:
+            return None
+        with self._job_clients_lock:
+            # Another thread may have built it while we were outside the lock.
+            self._job_clients.setdefault(job_id, client)
+            return self._job_clients[job_id]
+
+    def _process_item(self, job_id: str, item_key: str) -> None:
+        '''Download a single item. Runs inside the thread pool.'''
+        flight_key = (job_id, item_key)
+        with self._inflight_lock:
+            if flight_key in self._inflight:
+                return  # another thread is already handling this item
+            self._inflight.add(flight_key)
+
+        try:
+            self._do_process_item(job_id, item_key)
+        except (DownloadPaused, DownloadCancelled):
+            # Make sure any rich progress tasks left behind by the aborted
+            # download are marked finished, otherwise the UI would sum them
+            # with the fresh tasks created after resume/cancel.
+            self.bus.finish_tasks_for(job_id, item_key)
+            return
+        finally:
+            with self._inflight_lock:
+                self._inflight.discard(flight_key)
+
+    def _do_process_item(self, job_id: str, item_key: str) -> None:
+        '''Core logic for downloading a single item.'''
+        job = self._getjob(job_id)
+        if job is None:
+            return
+        item = next((it for it in job['items'] if it['key'] == item_key), None)
+        if item is None:
+            return
+
+        # Honour job-level cancellation before doing anything.
+        if job['cancel_event'].is_set():
+            item['status'] = 'cancelled'
+            self._update_job_status(job)
+            return
+
+        # If the job is paused, block until resumed or cancelled.
+        while job['pause_event'].is_set() and not job['cancel_event'].is_set():
+            if item['status'] not in ('done', 'error', 'cancelled'):
+                item['status'] = 'paused'
+            self._update_job_status(job)
+            time.sleep(0.2)
+
+        if job['cancel_event'].is_set():
+            item['status'] = 'cancelled'
+            self._update_job_status(job)
+            return
+
+        if item['status'] not in ('queued', 'paused'):
+            # Already handled by a previous run (e.g. resumed but item finished).
+            return
+
+        if not job['started_at']:
+            job['started_at'] = datetime.now().strftime('%H:%M:%S')
+        item['status'] = 'downloading'
+        self._update_job_status(job)
+
+        with self._parsed_lock:
+            video_info = self._parsed.get(item_key)
+        if video_info is None:
+            item['status'] = 'error'
+            item['error'] = 'the media item has expired, please parse the url again'
+            self._update_job_status(job)
+            return
+
+        source = str(getattr(video_info, 'source', '') or '')
+        client = self._get_or_build_job_client(job_id, source)
+        if client is None:
+            item['status'] = 'error'
+            item['error'] = self._import_error or 'the vd engine is not available'
+            self._update_job_status(job)
+            return
+
+        # Tag progress tasks created by the engine with this job/item so the UI
+        # can place a progress bar under the right item.
+        self.bus.set_context(job_id, item_key)
+        self.bus.add_interrupt(job_id, job['cancel_event'].is_set)
+        self.bus.add_pause(job_id, job['pause_event'].is_set)
+        try:
+            self.log('info', f"[{job['id']}] downloading: {item['title']}")
+            seq0 = self.log_seq
+            try:
+                downloaded = self.downloadvideoinfo(video_info, client)
+            except DownloadCancelled:
+                item['status'] = 'cancelled'
+                self.log('warning', f"[{job['id']}] cancelled item: {item['title']}")
+                raise
+            except DownloadPaused:
+                item['status'] = 'paused'
+                self.log('warning', f"[{job['id']}] paused: {item['title']}")
+                self._update_job_status(job)
+                self.bus.finish_tasks_for(job_id, item_key)
+                return
+            except Exception as err:
+                downloaded = []
+                # 引擎内部会捕获所有异常再以普通错误上抛，DownloadPaused/
+                # DownloadCancelled 到这里已变了味。按事件状态兜底归类，
+                # 避免"点暂停 → 任务直接失败"。
+                if job['pause_event'].is_set():
+                    item['status'] = 'paused'
+                    self.log('warning', f"[{job['id']}] paused: {item['title']}")
+                    self._update_job_status(job)
+                    self.bus.finish_tasks_for(job_id, item_key)
+                    return
+                if job['cancel_event'].is_set():
+                    item['status'] = 'cancelled'
+                    self.log('warning', f"[{job['id']}] cancelled item: {item['title']}")
+                    self._update_job_status(job)
+                    self.bus.finish_tasks_for(job_id, item_key)
+                    return
+                self.log('error', f"[{job['id']}] download error: {err}")
+                self.log('debug', traceback.format_exc())
+            if downloaded:
+                item['status'] = 'done'
+                first = downloaded[0]
+                try:
+                    item['save_path'] = str(first.save_path or item['save_path'])
+                except Exception:
+                    pass
+                with self._jobs_lock:
+                    job['done_count'] += item.get('subtask_count', 1)
+                self.log('info', f"[{job['id']}] saved to: {item['save_path']}")
+            else:
+                # 引擎也可能把暂停/取消异常吞掉后直接返回空列表（不抛异常）
+                if job['pause_event'].is_set():
+                    item['status'] = 'paused'
+                    self.log('warning', f"[{job['id']}] paused: {item['title']}")
+                    self._update_job_status(job)
+                    return
+                if job['cancel_event'].is_set():
+                    item['status'] = 'cancelled'
+                    self.log('warning', f"[{job['id']}] cancelled item: {item['title']}")
+                    self._update_job_status(job)
+                    return
+                item['status'] = 'error'
+                item['error'] = self._humanize_error(seq0)
+        except DownloadCancelled:
+            item['status'] = 'cancelled'
+            self.log('warning', f"[{job['id']}] cancelled item: {item['title']}")
+        finally:
+            self.bus.clear_context()
+            self.bus.remove_interrupt(job_id)
+            self.bus.remove_pause(job_id)
+            self._update_job_status(job)
+            self._save_parsed_cache()
+            self._save_jobs()
+
+    def _update_job_status(self, job: Dict[str, Any]) -> None:
+        '''Derive the job status from its item statuses.'''
+        statuses = [it['status'] for it in job['items']]
+        if job['cancel_event'].is_set() and all(s in ('cancelled', 'done', 'error') for s in statuses):
+            job['status'] = 'cancelled'
+        elif all(s == 'done' for s in statuses):
+            job['status'] = 'done'
+            job['finished_at'] = job['finished_at'] or datetime.now().strftime('%H:%M:%S')
+            self.log('info', f"job {job['id']} finished: {job['done_count']}/{job['total_count']} succeeded")
+        elif all(s == 'error' for s in statuses):
+            job['status'] = 'error'
+            job['finished_at'] = job['finished_at'] or datetime.now().strftime('%H:%M:%S')
+        elif all(s == 'cancelled' for s in statuses):
+            job['status'] = 'cancelled'
+            job['finished_at'] = job['finished_at'] or datetime.now().strftime('%H:%M:%S')
+        elif job['cancel_event'].is_set():
+            # Preserve the explicit cancelling state while active items finish up.
+            job['status'] = 'cancelling'
+        elif any(s == 'downloading' for s in statuses):
+            job['status'] = 'downloading'
+        elif any(s == 'paused' for s in statuses):
+            job['status'] = 'paused'
+        else:
+            job['status'] = 'queued'
+
+    def _on_item_done(self, future: Future) -> None:
+        '''Clean up the futures registry when an item task finishes.'''
+        with self._futures_lock:
+            self._futures.pop(future, None)
+        try:
+            future.result()
+        except CancelledError:
+            return  # cancelled before the task started running
+        except (DownloadPaused, DownloadCancelled):
+            return  # handled by _do_process_item; do not log as crash
+        except Exception as err:
+            diag.log('core', f'item task raised unhandled exception: {err}', 'error')
+
+    def pause(self, job_id: str) -> Dict[str, Any]:
+        with self._jobs_lock:
+            job = self._jobs.get(job_id)
+        if not job:
+            return {'ok': False, 'error': 'job not found'}
+        if job['status'] in {'queued', 'downloading'}:
+            job['status'] = 'pausing'
+            job['pause_event'].set()
+            self.log('warning', f'job {job_id} is being paused')
+        self._save_jobs()
+        return {'ok': True}
+
+    def resume(self, job_id: str) -> Dict[str, Any]:
+        with self._jobs_lock:
+            job = self._jobs.get(job_id)
+        if not job:
+            return {'ok': False, 'error': 'job not found'}
+        # Ignore duplicate clicks while a reparse is already in flight.
+        if job['status'] == 'resuming':
+            return {'ok': True, 'async': True}
+        if job['status'] not in {'paused', 'pausing', 'error'}:
+            return {'ok': True}
+        # Retry: requeue any errored items so they get downloaded again.
+        if job['status'] == 'error':
+            for item in job['items']:
+                if item['status'] == 'error':
+                    item['status'] = 'queued'
+                    item['error'] = ''
+        # After a restart the parsed VideoInfo objects are gone, so we can't just
+        # re-submit the old keys. Re-parse the source urls to rebuild them and
+        # remap unfinished items to fresh keys. Already-finished files on disk are
+        # skipped; the rest re-download and the engine's own downloader resumes
+        # from any existing .part file (this is the "断点续传" path).
+        missing_in_memory = any(item['key'] not in self._parsed for item in job['items'])
+        need_reparse = job.get('restored', False) or missing_in_memory
+        self.log('info', f'job {job_id} resume requested: restored={job.get("restored", False)} missing_parsed={missing_in_memory}')
+        if not need_reparse:
+            # Fast path: nothing to re-parse, just wake up the workers.
+            job['pause_event'].clear()
+            job['status'] = 'downloading'
+            self._submit_resumed_items(job)
+            self._save_jobs()
+            self.log('info', f'job {job_id} resumed')
+            return {'ok': True}
+        # Slow path: re-parsing can take several seconds (engine IO + possible
+        # browser fallback). Run it on a background thread so the pywebview bridge
+        # does not freeze the "恢复中" UI.
+        job['status'] = 'resuming'
+        job['pause_event'].clear()
+        self._save_jobs()
+
+        def _resume_worker():
+            try:
+                self._reparse_for_resume(job)
+            except Exception as err:
+                self.log('error', f'job {job_id} reparse failed: {err}')
+                self.log('debug', traceback.format_exc())
+            with self._jobs_lock:
+                live_job = self._jobs.get(job_id)
+            if live_job is not job:
+                return
+            # If the user cancelled while we were reparsing, do not restart downloads.
+            if job.get('cancel_event') and job['cancel_event'].is_set():
+                return
+            # Something else changed the job state; respect it.
+            if job.get('status') != 'resuming':
+                return
+            self._update_job_status(job)
+            if job['status'] == 'error':
+                self.log('warning', f'job {job_id} resume failed: reparse produced no usable items')
+                self._save_jobs()
+                return
+            job['status'] = 'downloading'
+            self._submit_resumed_items(job)
+            self.log('info', f'job {job_id} resumed after reparse')
+
+        threading.Thread(target=_resume_worker, name=f'resume-{job_id}', daemon=True).start()
+        return {'ok': True, 'async': True}
+
+    def _submit_resumed_items(self, job: Dict[str, Any]) -> None:
+        '''Re-submit paused/queued items after a resume.'''
+        job_id = job['id']
+        self._ensure_executor()
+        for item in job['items']:
+            if item['status'] in ('paused', 'queued'):
+                # Clear stale progress tasks from the previous run so the UI does
+                # not sum old bytes with the new download.
+                self.bus.finish_tasks_for(job_id, item['key'])
+                flight_key = (job_id, item['key'])
+                with self._inflight_lock:
+                    already_running = flight_key in self._inflight
+                if already_running:
+                    item['status'] = 'downloading'
+                    continue
+                item['status'] = 'queued'
+                future = self._executor.submit(self._process_item, job_id, item['key'])
+                with self._futures_lock:
+                    self._futures[future] = (job_id, item['key'])
+                future.add_done_callback(self._on_item_done)
+        self._save_jobs()
+
+    def _reparse_for_resume(self, job: Dict[str, Any]) -> None:
+        '''Re-parse the job's source urls to rebuild the (non-serializable)
+        VideoInfo objects needed for downloading, and remap unfinished items to
+        fresh parsed keys. Finished items whose file still exists are kept as
+        done so they are not re-downloaded.'''
+        import uuid
+        self.ensureengine(wait=True)
+        if not self.engineready:
+            with self._jobs_lock:
+                for item in job['items']:
+                    if item['status'] not in ('done',):
+                        item['status'] = 'error'
+                        item['error'] = '引擎未就绪，无法继续，请回到主页重新解析链接'
+            return
+        urls = job.get('urls') or ([job['url']] if job.get('url') else [])
+        sources_needed = job.get('sources_needed') or []
+        # For jobs that we know belong to a specific platform parser, skip the
+        # WebMediaGrabber fallback during reparse. The fallback can get stuck
+        # probing direct media URLs that have expired (e.g. googlevideo 403)
+        # and adds no value when the original parser is available.
+        skip_web_fallback = bool(sources_needed) and all(s != 'WebMediaGrabber' for s in sources_needed)
+        fresh_by_title: Dict[str, List[str]] = {}
+        fresh_by_identifier: Dict[str, List[str]] = {}
+        parsed_count = 0
+        for url in urls:
+            try:
+                # Lazy-import the platform parser(s) for this url so the
+                # job-scoped client actually contains the required source.
+                self._ensure_parsers_for_url(url)
+                client = self._buildclient(allowed=sources_needed or None)
+                video_infos = client.parsefromurl(url=url, skip_web_media_grabber_fallback=skip_web_fallback) or []
+            except Exception as err:
+                self.log('error', f'reparse failed for {url}: {err}')
+                continue
+            with self._parsed_lock:
+                for vi in video_infos:
+                    k = uuid.uuid4().hex
+                    self._parsed[k] = vi
+                    self._parsed_url[k] = url
+                    title = str(getattr(vi, 'title', '') or '').strip()
+                    identifier = self._identifier_for(vi)
+                    if identifier:
+                        fresh_by_identifier.setdefault(identifier, []).append(k)
+                    if title:
+                        fresh_by_title.setdefault(title, []).append(k)
+                    parsed_count += 1
+        self.log('info', f'reparse for job {job["id"]}: parsed {parsed_count} item(s) from {len(urls)} url(s)')
+        remapped = 0
+        missing = 0
+        with self._jobs_lock:
+            for item in job['items']:
+                if item['status'] == 'done' and item.get('save_path') and Path(item['save_path']).exists():
+                    continue  # already downloaded, keep as done
+                title = str(item.get('title', '') or '').strip()
+                identifier = str(item.get('identifier', '') or '').strip()
+                fresh: List[str] = []
+                if identifier and identifier in fresh_by_identifier:
+                    fresh = fresh_by_identifier[identifier]
+                elif title and title in fresh_by_title:
+                    fresh = fresh_by_title[title]
+                if fresh:
+                    new_key = fresh.pop(0)
+                    new_vi = self._parsed.get(new_key)
+                    item['key'] = new_key
+                    item['status'] = 'queued'
+                    item['error'] = ''
+                    if new_vi is not None:
+                        item['subtask_count'] = self._subtask_count_for(new_vi)
+                        item['identifier'] = self._identifier_for(new_vi)
+                    remapped += 1
+                elif item['status'] != 'done':
+                    item['status'] = 'error'
+                    item['error'] = '重新解析后未找到该条目，请回到主页重新解析链接'
+                    missing += 1
+            job['total_count'] = sum(it.get('subtask_count', 1) for it in job['items'])
+            job['done_count'] = sum(it.get('subtask_count', 1) for it in job['items'] if it['status'] == 'done')
+            job['restored'] = False
+        self.log('info', f'reparse for job {job["id"]}: remapped {remapped} item(s), {missing} missing; total_subtasks={job["total_count"]} done_subtasks={job["done_count"]}')
+        self._save_parsed_cache()
 
     def cancel(self, job_id: str) -> Dict[str, Any]:
         with self._jobs_lock:
             job = self._jobs.get(job_id)
         if not job:
             return {'ok': False, 'error': 'job not found'}
+        # Terminal jobs are removed immediately so the X button always works.
+        if job['status'] in {'done', 'error', 'cancelled'}:
+            self._remove_job(job_id)
+            return {'ok': True}
         job['cancel_event'].set()
-        if job['status'] in {'queued', 'downloading'}:
+        job['pause_event'].clear()
+        # Mark all progress tasks for this job as finished immediately; active
+        # downloads may create fresh updates for a moment, but stale tasks from
+        # earlier attempts must not stack with new ones.
+        self.bus.finish_tasks_for(job_id)
+        if job['status'] in {'queued', 'downloading', 'paused', 'pausing', 'resuming'}:
             job['status'] = 'cancelling'
+        # Cancel queued futures that have not started yet so they don't block.
+        with self._futures_lock:
+            for future, (jid, ikey) in list(self._futures.items()):
+                if jid != job_id:
+                    continue
+                if future.cancel():
+                    for item in job['items']:
+                        if item['key'] == ikey:
+                            item['status'] = 'cancelled'
+                            break
+        # Cancel any item that is not actively downloading right now. Active
+        # downloads will finish cancellation themselves via the cancel_event.
+        for item in job['items']:
+            if item['status'] in ('queued', 'paused', 'error'):
+                item['status'] = 'cancelled'
+            if item['status'] != 'done':
+                try:
+                    part = Path(str(item['save_path'] or ''))
+                    if part and part.suffix:
+                        part_part = part.with_suffix(part.suffix + '.part')
+                        if part_part.exists():
+                            part_part.unlink()
+                except Exception:
+                    pass
+        # If there is nothing left to cancel, mark the job as cancelled now.
+        if all(it['status'] in ('done', 'cancelled', 'error') for it in job['items']):
+            job['status'] = 'cancelled'
         self.log('warning', f'job {job_id} is being cancelled')
+        self._save_jobs()
+        # If everything was already terminal, remove the job from the UI now.
+        if job['status'] in {'done', 'error', 'cancelled'}:
+            self._remove_job(job_id)
         return {'ok': True}
 
     def clearjobs(self) -> Dict[str, Any]:
+        removed = []
         with self._jobs_lock:
             finished = [job_id for job_id, job in self._jobs.items() if job['status'] in {'done', 'error', 'cancelled'}]
             for job_id in finished:
-                self._jobs.pop(job_id, None)
+                removed.append(self._jobs.pop(job_id, None))
+                with self._job_clients_lock:
+                    self._job_clients.pop(job_id, None)
+        for job in removed:
+            self._cleanup_parsed_cache(job)
+        self._save_jobs()
+        self._save_parsed_cache()
         return {'ok': True, 'removed': len(finished)}
 
-    def _getjob(self, job_id: str):
-        with self._jobs_lock:
-            return self._jobs.get(job_id)
+    def shutdown(self) -> None:
+        '''Best-effort clean shutdown used when the window is closed.
 
-    def _workerloop(self) -> None:
-        diag.log('core', 'worker loop entered (waiting for jobs)')
-        while True:
-            job_id = self._queue.get()
-            diag.log('core', f'worker picked up job {job_id}')
-            job = self._getjob(job_id)
-            if job is None:
-                diag.log('core', f'job {job_id} disappeared before start', 'warning')
-                continue
-            self._runjob(job)
-            self._queue.task_done()
-
-    def _runjob(self, job: Dict[str, Any]) -> None:
-        diag.log('core', f"job {job['id']} started ({job['total_count']} item(s))")
-        job['status'] = 'downloading'
-        job['started_at'] = datetime.now().strftime('%H:%M:%S')
-        cancel_event: threading.Event = job['cancel_event']
-        self.bus.reset()
-        self.bus.set_interrupt(cancel_event.is_set)
+        We must NOT cancel jobs here. Unfinished jobs are intentionally
+        persisted to jobs.json so they are restored as PAUSED on the next launch
+        and the user can resume them manually — cancelling would mark them
+        "cancelled" and drop them from the restore. So shutdown only:
+          * stops the executor (no new tasks scheduled),
+          * kills any lingering child processes (ffmpeg/aria2c/node), and
+          * flushes the current job state to disk.
+        The process itself is terminated by the caller via os._exit, which also
+        kills the WebView2 and engine child tree, so any still-running download
+        thread is reaped without leaving orphans.'''
         try:
-            # build the download client with ONLY the parsers that produced
-            # the items in this job. No unused parsers get instantiated, so
-            # the client stays minimal even after many varied URLs.
-            sources_needed: List[str] = []
-            for _it in job['items']:
-                with self._parsed_lock:
-                    _vi = self._parsed.get(_it['key'])
-                if _vi is not None:
-                    _src = str(getattr(_vi, 'source', '') or '')
-                    if _src and _src not in sources_needed and _src != 'WebMediaGrabber':
-                        sources_needed.append(_src)
-            client = self._buildclient(allowed=sources_needed or None)
-            if client is None:
-                raise RuntimeError(self._import_error or 'the vd engine is not available')
-            # cache the job-scoped client so `_sourceclient` reuses it
-            # instead of rebuilding with allowed=None (which would re-add
-            # every previously-registered parser and defeat the purpose).
-            self._active_client = client
-            for item in job['items']:
-                if cancel_event.is_set():
-                    break
-                with self._parsed_lock:
-                    video_info = self._parsed.get(item['key'])
-                if video_info is None:
-                    item['status'] = 'error'
-                    item['error'] = 'the media item has expired, please parse the url again'
-                    continue
-                item['status'] = 'downloading'
-                self.log('info', f"[{job['id']}] downloading: {item['title']}")
-                seq0 = self.log_seq
+            with self._executor_lock:
+                ex = self._executor
+                self._executor = None
+            if ex is not None:
                 try:
-                    downloaded = self.downloadvideoinfo(video_info)
-                except DownloadCancelled:
-                    raise
-                except Exception as err:
-                    downloaded = []
-                    self.log('error', f"[{job['id']}] download error: {err}")
-                    self.log('debug', traceback.format_exc())
-                if downloaded:
-                    item['status'] = 'done'
-                    first = downloaded[0]
-                    try:
-                        item['save_path'] = str(first.save_path or item['save_path'])
-                    except Exception:
-                        pass
-                    job['done_count'] += 1
-                    self.log('info', f"[{job['id']}] saved to: {item['save_path']}")
-                else:
-                    item['status'] = 'error'
-                    item['error'] = self._humanize_error(seq0)
-            if cancel_event.is_set():
-                job['status'] = 'cancelled'
-                self.log('warning', f"job {job['id']} cancelled")
-            else:
-                job['status'] = 'done'
-                self.log('info', f"job {job['id']} finished: {job['done_count']}/{job['total_count']} succeeded")
-        except DownloadCancelled:
-            job['status'] = 'cancelled'
-            self.log('warning', f"job {job['id']} cancelled")
+                    ex.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    pass
+            _kill_tracked_subprocesses()
+            # Persist current job state (including unfinished jobs) so the next
+            # launch can restore them as paused. Do NOT cancel them.
+            try:
+                self._save_jobs()
+            except Exception:
+                pass
+            diag.log('core', 'service shutdown: executor stopped, child processes killed, jobs left intact for restore')
         except Exception as err:
-            job['status'] = 'error'
-            job['error'] = str(err)
-            self.log('error', f"job {job['id']} failed: {err}")
-            self.log('debug', traceback.format_exc())
-        finally:
-            self._active_client = None
-            self.bus.set_interrupt(None)
-            job['finished_at'] = datetime.now().strftime('%H:%M:%S')
-            for item in job['items']:
-                if item['status'] == 'downloading':
-                    item['status'] = 'cancelled'
-            diag.log('core', f"job {job['id']} finished with status={job['status']} done={job['done_count']}/{job['total_count']}")
+            diag.log('core', f'shutdown error (ignored): {err}', 'warning')
+
+    '''-------------------- job persistence --------------------'''
+
+    def _save_jobs(self) -> None:
+        '''Persist the current jobs (metadata only) to jobs.json so paused /
+        failed tasks survive an app restart. VideoInfo objects are NOT
+        serializable, so only plain job/item metadata is stored; a resume after
+        restart re-parses the source url to rebuild them (see resume()).'''
+        try:
+            with self._jobs_lock:
+                data = [self._serialize_job(j) for j in self._jobs.values()]
+            Config.jobspath().write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+        except Exception as err:
+            diag.log('core', f'failed to save jobs: {err}', 'warning')
+
+    @staticmethod
+    def _serialize_job(job: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            'id': job['id'], 'status': job['status'], 'error': job.get('error', ''),
+            'created_at': job.get('created_at', ''), 'started_at': job.get('started_at', ''),
+            'finished_at': job.get('finished_at', ''), 'work_dir': job.get('work_dir', ''),
+            'url': job.get('url', ''),
+            'urls': job.get('urls', []) or ([job['url']] if job.get('url') else []),
+            'done_count': job.get('done_count', 0),
+            'total_count': job.get('total_count', len(job.get('items', []))),
+            'sources_needed': job.get('sources_needed', []),
+            'restored': job.get('restored', False),
+            'items': [
+                {'key': it['key'], 'title': it.get('title', ''), 'save_path': it.get('save_path', ''),
+                 'status': it['status'], 'error': it.get('error', ''),
+                 'subtask_count': it.get('subtask_count', 1), 'identifier': it.get('identifier', '')}
+                for it in job.get('items', [])
+            ],
+        }
+
+    def _load_jobs(self) -> None:
+        '''Load persisted jobs at startup.
+
+        Live download threads are gone after a restart, so every non-terminal
+        job is restored as PAUSED — shown in the task list but NOT started. The
+        user begins it manually via the per-job "开始/继续" button, which calls
+        `resume()`; `resume()` re-parses the source url to rebuild the
+        (non-serializable) VideoInfo and resumes from any existing partial file,
+        so already-completed items stay done and only the missing ones are
+        fetched. Terminal jobs (done / error / cancelled) are kept as-is for
+        reference. This gives "restart -> unfinished tasks are back, but idle
+        until the user explicitly starts them".'''
+        path = Config.jobspath()
+        if not path.exists():
+            return
+        try:
+            raw = json.loads(path.read_text(encoding='utf-8') or '[]')
+        except Exception as err:
+            diag.log('core', f'failed to read jobs.json: {err}', 'warning')
+            return
+        loaded = 0
+        restored = 0
+        with self._jobs_lock:
+            for rec in raw:
+                if not isinstance(rec, dict) or not rec.get('id'):
+                    continue
+                status = rec.get('status', 'queued')
+                items = []
+                for it in rec.get('items', []):
+                    ist = it.get('status', 'queued')
+                    sub_count = it.get('subtask_count', 1)
+                    common = {
+                        'key': it.get('key', ''), 'title': it.get('title', ''),
+                        'save_path': it.get('save_path', ''), 'subtask_count': sub_count,
+                        'identifier': it.get('identifier', ''),
+                    }
+                    if ist == 'done':
+                        # Completed items stay done; only the missing ones are
+                        # re-fetched when the user starts the job.
+                        items.append({**common, 'status': 'done', 'error': it.get('error', '')})
+                    else:
+                        # Everything else resets to queued so a manual "start"
+                        # re-submits only what is still missing.
+                        items.append({**common, 'status': 'queued', 'error': ''})
+                # Non-terminal jobs are restored as paused (NOT auto-started).
+                restored_status = 'paused' if status not in ('done', 'error', 'cancelled') else status
+                total_subtasks = sum(it.get('subtask_count', 1) for it in items)
+                done_subtasks = sum(it.get('subtask_count', 1) for it in items if it['status'] == 'done')
+                job = {
+                    'id': rec['id'], 'items': items, 'status': restored_status, 'error': rec.get('error', ''),
+                    'created_at': rec.get('created_at', ''), 'started_at': rec.get('started_at', ''),
+                    'finished_at': rec.get('finished_at', ''), 'work_dir': rec.get('work_dir', self.config.work_dir),
+                    'cancel_event': threading.Event(), 'pause_event': threading.Event(),
+                    'done_count': done_subtasks, 'total_count': total_subtasks,
+                    'url': rec.get('url', ''),
+                    'urls': rec.get('urls', []) or ([rec['url']] if rec.get('url') else []),
+                    'sources_needed': rec.get('sources_needed', []),
+                    'restored': True,
+                }
+                self._jobs[job['id']] = job
+                loaded += 1
+                if restored_status == 'paused':
+                    restored += 1
+        if loaded:
+            diag.log('core', f'loaded {loaded} persisted job(s): {restored} unfinished restored as paused, '
+                              f'{loaded - restored} terminal kept for reference')
+            self._save_jobs()
+
+    '''-------------------- parsed cache persistence --------------------'''
+
+    def _parsed_cache_path(self) -> Path:
+        return Config.configpath().parent / 'parsed_cache.pkl'
+
+    def _save_parsed_cache(self) -> None:
+        '''Persist the in-memory VideoInfo objects that are still needed by
+        loaded jobs (queued/paused/downloading/error) so retry/resume within
+        the same session does not have to re-parse the source url.'''
+        try:
+            needed: Set[str] = set()
+            with self._jobs_lock:
+                for job in self._jobs.values():
+                    if job['status'] in ('done', 'cancelled'):
+                        continue
+                    for it in job['items']:
+                        if it['status'] not in ('done', 'cancelled'):
+                            needed.add(it['key'])
+            with self._parsed_lock:
+                to_save = {k: self._parsed[k] for k in needed if k in self._parsed}
+            path = self._parsed_cache_path()
+            path.write_bytes(pickle.dumps(to_save, protocol=pickle.HIGHEST_PROTOCOL))
+            diag.log('core', f'saved parsed cache: {len(to_save)} item(s)')
+        except Exception as err:
+            diag.log('core', f'failed to save parsed cache: {err}', 'warning')
+
+    def _load_parsed_cache(self) -> None:
+        try:
+            path = self._parsed_cache_path()
+            if not path.exists():
+                return
+            # VideoInfo pickles reference engine modules; make sure the engine source
+            # is importable before unpickling so the cache can load successfully.
+            if str(VD_SRC) not in sys.path and VD_SRC.exists():
+                sys.path.insert(0, str(VD_SRC))
+            with self._parsed_lock:
+                data = pickle.loads(path.read_bytes())
+                # Only restore cache entries that belong to jobs still loaded
+                # after restart. Discarded unfinished jobs must not leave stale
+                # VideoInfo objects in memory.
+                needed: Set[str] = set()
+                with self._jobs_lock:
+                    for job in self._jobs.values():
+                        for it in job.get('items', []):
+                            needed.add(it.get('key'))
+                self._parsed.update({k: v for k, v in data.items() if k in needed})
+            diag.log('core', f'loaded parsed cache: {len(data)} item(s)')
+        except Exception as err:
+            diag.log('core', f'failed to load parsed cache: {err}', 'warning')
+
+    def _cleanup_parsed_cache(self, job: Dict[str, Any]) -> None:
+        '''Drop parsed VideoInfo entries that are no longer needed by any job.'''
+        if not job:
+            return
+        with self._parsed_lock:
+            for item in job.get('items', []):
+                key = item.get('key')
+                if key:
+                    self._parsed.pop(key, None)
+                    self._parsed_url.pop(key, None)
+
+    def _remove_job(self, job_id: str) -> None:
+        '''Remove a job and its parsed cache entries, then persist state.'''
+        with self._jobs_lock:
+            job = self._jobs.pop(job_id, None)
+        if not job:
+            return
+        self._cleanup_parsed_cache(job)
+        with self._job_clients_lock:
+            self._job_clients.pop(job_id, None)
+        self._save_jobs()
+        self._save_parsed_cache()
 
     '''-------------------- state --------------------'''
 
@@ -931,7 +1597,13 @@ class VideoDlService():
             jobs = list(self._jobs.values())
         result = []
         for job in jobs:
-            items_meta = [{'title': i['title'], 'save_path': i['save_path'], 'status': i['status'], 'error': i['error']} for i in job['items']]
+            items_meta = [
+                {
+                    'key': i['key'], 'title': i['title'], 'save_path': i['save_path'],
+                    'status': i['status'], 'error': i['error'],
+                }
+                for i in job['items']
+            ]
             result.append({
                 'id': job['id'], 'status': job['status'], 'error': job['error'], 'work_dir': job['work_dir'],
                 'created_at': job['created_at'], 'started_at': job['started_at'], 'finished_at': job['finished_at'],
@@ -973,6 +1645,26 @@ class VideoDlService():
             else:
                 return {'ok': False, 'error': f'path does not exist: {path}'}
             return {'ok': True}
+        except Exception as err:
+            return {'ok': False, 'error': str(err)}
+
+    @staticmethod
+    def revealpath(path: str) -> Dict[str, Any]:
+        '''打开文件所在目录并选中该文件（explorer /select）；目录或不存在时退化到打开目录。'''
+        try:
+            target = Path(path)
+            if target.is_file():
+                subprocess.Popen(['explorer', '/select,', str(target)])
+                return {'ok': True}
+            if target.is_dir():
+                os.startfile(str(target))
+                return {'ok': True}
+            # 目标不存在时尝试打开所在目录（文件可能尚未生成或已被清理）
+            parent = target.parent
+            if parent.is_dir():
+                os.startfile(str(parent))
+                return {'ok': True}
+            return {'ok': False, 'error': f'path does not exist: {path}'}
         except Exception as err:
             return {'ok': False, 'error': str(err)}
 

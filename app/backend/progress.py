@@ -2,6 +2,7 @@
 Function:
     Capture the download progress of vd (which is printed by `rich.progress.Progress`)
     and turn it into plain data that the webview frontend can poll.
+    Also supports per-job pause/resume and per-item progress tagging.
 Author:
     CodeBuddy
 '''
@@ -48,6 +49,10 @@ class DownloadCancelled(Exception):
     '''Raised inside the download worker when the user cancels a job.'''
 
 
+class DownloadPaused(Exception):
+    '''Raised inside the download worker when the user pauses a job.'''
+
+
 class ProgressBus():
     '''Singleton store that mirrors the state of every rich progress task.'''
 
@@ -57,32 +62,101 @@ class ProgressBus():
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._tasks: Dict[str, Dict[str, Any]] = {}
-        self._interrupt: Optional[Callable[[], bool]] = None
+        # Multiple concurrent jobs may be downloading at the same time.
+        # Interrupt/pause checks are keyed by job_id so one job's controls
+        # do not leak into another.
+        self._interrupts: Dict[str, Callable[[], bool]] = {}
+        self._pauses: Dict[str, Callable[[], bool]] = {}
+        # Per-thread context lets the desktop backend tag every progress task
+        # created by the engine with the job/item it belongs to, so the UI can
+        # show a progress bar under the correct downloading item.
+        # NOTE: the engine spawns its own worker threads for segment/multi-stream
+        # downloads; tasks created from those threads would get no thread-local
+        # context, so we keep a global fallback (the most recently set context)
+        # and use it whenever the current thread has none.
+        self._context = threading.local()
+        self._fallback: Dict[str, Optional[str]] = {'job_id': None, 'item_key': None}
 
     @classmethod
     def instance(cls) -> 'ProgressBus':
         if cls._instance is None:
             with cls._instance_lock:
-                cls._instance = cls._instance or cls()
+                cls._instance = cls() or cls._instance
         return cls._instance
 
-    def set_interrupt(self, func: Optional[Callable[[], bool]]) -> None:
+    def set_context(self, job_id: str, item_key: str) -> None:
+        '''Set the (job_id, item_key) context for the current thread.'''
+        self._context.job_id = job_id
+        self._context.item_key = item_key
+        self._fallback['job_id'] = job_id
+        self._fallback['item_key'] = item_key
+
+    def clear_context(self) -> None:
+        '''Clear the per-thread context.'''
+        self._context.job_id = None
+        self._context.item_key = None
+
+    def _current_context(self):
+        '''(job_id, item_key) for the current thread, falling back to the most
+        recently set context for engine-spawned threads that have none.'''
+        job_id = getattr(self._context, 'job_id', None)
+        item_key = getattr(self._context, 'item_key', None)
+        if job_id is not None or item_key is not None:
+            return job_id, item_key
+        return self._fallback['job_id'], self._fallback['item_key']
+
+    def add_interrupt(self, key: str, func: Optional[Callable[[], bool]]) -> None:
         with self._lock:
-            self._interrupt = func
+            if func is None:
+                self._interrupts.pop(key, None)
+            else:
+                self._interrupts[key] = func
+
+    def remove_interrupt(self, key: str) -> None:
+        with self._lock:
+            self._interrupts.pop(key, None)
+
+    def add_pause(self, key: str, func: Optional[Callable[[], bool]]) -> None:
+        with self._lock:
+            if func is None:
+                self._pauses.pop(key, None)
+            else:
+                self._pauses[key] = func
+
+    def remove_pause(self, key: str) -> None:
+        with self._lock:
+            self._pauses.pop(key, None)
 
     def checkinterrupt(self) -> None:
+        # Pause/cancel are per-job: only the *current* job (resolved from the
+        # calling thread's context) may raise. Iterating every registered check
+        # would leak one job's pause/cancel into all concurrent downloads.
+        job_id, _ = self._current_context()
+        if not job_id:
+            return
         with self._lock:
-            interrupt = self._interrupt
-        if interrupt is not None and interrupt():
+            check = self._interrupts.get(job_id)
+        if check is not None and check():
             raise DownloadCancelled('the download job has been cancelled by the user')
+
+    def checkpause(self) -> None:
+        job_id, _ = self._current_context()
+        if not job_id:
+            return
+        with self._lock:
+            check = self._pauses.get(job_id)
+        if check is not None and check():
+            raise DownloadPaused('the download job has been paused by the user')
 
     def onadd(self, owner: str, task_id: Any, description: str, total: Optional[float], fields: Dict[str, Any]) -> None:
         key = f'{owner}:{task_id}'
+        ctx_job, ctx_item = self._current_context()
         with self._lock:
             self._tasks[key] = {
                 'key': key, 'description': str(description), 'completed': 0.0, 'total': total,
                 'kind': fields.get('kind', 'download'), 'speed': None, 'finished': False,
                 'started_at': time.time(), 'updated_at': time.time(),
+                'job_id': ctx_job, 'item_key': ctx_item,
             }
 
     def onupdate(self, owner: str, task_id: Any, task: Any = None) -> None:
@@ -90,8 +164,24 @@ class ProgressBus():
         with self._lock:
             item = self._tasks.get(key)
             if item is None:
-                item = {'key': key, 'description': '', 'completed': 0.0, 'total': None, 'kind': 'download', 'speed': None, 'finished': False, 'started_at': time.time()}
+                ctx_job, ctx_item = self._current_context()
+                item = {
+                    'key': key, 'description': '', 'completed': 0.0, 'total': None,
+                    'kind': 'download', 'speed': None, 'finished': False,
+                    'started_at': time.time(), 'job_id': ctx_job, 'item_key': ctx_item,
+                }
                 self._tasks[key] = item
+            else:
+                ctx_job = item.get('job_id')
+                ctx_item = item.get('item_key')
+            # Engine-spawned worker threads have no thread-local context of their
+            # own, so they would otherwise fall back to whichever job set context
+            # most recently (possibly a *different* job). Bind the calling thread
+            # to this task's job the first time we see it, so the pause/cancel
+            # checks performed inside the worker target the correct job — this is
+            # what stops pausing one job from pausing a concurrent download.
+            if getattr(self._context, 'job_id', None) is None and ctx_job:
+                self.set_context(ctx_job, ctx_item or '')
             if task is not None:
                 item['description'] = str(getattr(task, 'description', item['description']) or '')
                 item['completed'] = float(getattr(task, 'completed', 0.0) or 0.0)
@@ -117,6 +207,19 @@ class ProgressBus():
         with self._lock:
             self._tasks.clear()
 
+    def finish_tasks_for(self, job_id: str, item_key: Optional[str] = None) -> None:
+        '''Mark all progress tasks belonging to (job_id, item_key) as finished.
+        Called when an item is paused/cancelled/resumed so the next run does
+        not stack its bytes on top of stale progress tasks in the UI.'''
+        with self._lock:
+            for item in self._tasks.values():
+                if item.get('job_id') != job_id:
+                    continue
+                if item_key is not None and item.get('item_key') != item_key:
+                    continue
+                item['finished'] = True
+                item['updated_at'] = time.time()
+
     def snapshot(self) -> List[Dict[str, Any]]:
         with self._lock:
             items = list(self._tasks.values())
@@ -141,6 +244,7 @@ class ProgressBus():
                 'key': item['key'], 'description': item['description'], 'kind': item['kind'],
                 'completed': completed, 'total': total, 'percent': percent, 'speed': speed, 'eta': eta,
                 'finished': bool(item['finished']), 'elapsed': round(time.time() - item['started_at'], 1),
+                'job_id': item.get('job_id'), 'item_key': item.get('item_key'),
             })
         result.sort(key=lambda x: (x['kind'] != 'overall', x['description']))
         return result
@@ -178,6 +282,7 @@ class DesktopProgress(RichProgress):
     def update(self, task_id, **kwargs):
         result = super(DesktopProgress, self).update(task_id, **kwargs)
         ProgressBus.instance().onupdate(self._owner, task_id, self._tasks.get(task_id))
+        ProgressBus.instance().checkpause()
         ProgressBus.instance().checkinterrupt()
         return result
 

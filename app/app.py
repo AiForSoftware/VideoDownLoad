@@ -281,7 +281,11 @@ def _cleanupstalewebviewprocesses(user_data_folder: str) -> int:
 # WebView2 page has actually loaded; the supervisor watches it to detect a hung init.
 WV_LOADED_FLAG_ENV = 'VD_WV_LOADED_FLAG'
 MAX_UI_ATTEMPTS = 5
-UI_LOAD_TIMEOUT = 15  # healthy page loads measure 3-10s; past 15s the WebView2 init is hung
+# A healthy page measures 3-10s, but a *cold* first launch on a machine that just
+# force-killed a previous instance can take longer while the OS releases the
+# WebView2 lock. 15s was too aggressive and killed slow-but-alive inits, forcing
+# the user to wait through several silent retries before the window appeared.
+UI_LOAD_TIMEOUT = 30
 
 
 def _wait_for_webview_loaded(flag_path: str, timeout: float) -> bool:
@@ -301,6 +305,28 @@ def _kill_process_tree(pid: int) -> None:
                        capture_output=True, text=True, timeout=20)
     except Exception as err:
         diag.log('app', f'_kill_process_tree({pid}) failed: {err}', 'debug')
+
+
+def _hard_exit() -> None:
+    '''Forcefully terminate THIS process and its entire child tree. Used as the
+    final guarantee on window close so nothing is left running in the background.
+
+    The UI child hosts both the WebView2 runtime (msedgewebview2.exe) AND every
+    engine subprocess (ffmpeg / aria2c / node / DrissionPage browser). If any of
+    those is still alive when the window closes — e.g. a download was cancelled
+    mid-flight, or a worker thread is blocked — the python process would never
+    exit on its own and they would all linger. Killing the whole tree here makes
+    the "close window == process gone" contract actually hold.'''
+    try:
+        me = psutil.Process(os.getpid())
+        for child in me.children(recursive=True):
+            try:
+                child.kill()
+            except Exception:
+                pass
+    except Exception as err:
+        diag.log('app', f'_hard_exit: child kill failed: {err}', 'debug')
+    os._exit(0)
 
 
 def run_ui(args) -> int:
@@ -393,6 +419,22 @@ def run_ui(args) -> int:
 
     window.events.loaded += onloaded
 
+    def _on_closed():
+        '''Window was closed: cancel downloads, kill child processes, and make
+        absolutely sure the process (and its WebView2 / engine children) exits.
+
+        Without this, a still-running download keeps the non-daemon executor
+        thread alive and the ffmpeg/aria2c/node children (and msedgewebview2.exe)
+        keep running in the background after the window is gone.'''
+        diag.log('app', 'window closed; cancelling jobs and terminating background processes')
+        try:
+            api.shutdown()
+        except Exception as err:
+            diag.log('app', f'_on_closed: api.shutdown failed: {err}', 'debug')
+        _hard_exit()
+
+    window.events.closed += _on_closed
+
     def watchdog():
         '''If the page never loads, the WebView2 init is dead-locked. The supervisor
         process is watching the loaded flag and will kill+restart us; here we only log.'''
@@ -425,6 +467,21 @@ def run_supervisor(args) -> int:
 
     if not acquiresingleinstance():
         return 0
+
+    # Kill orphaned WebView2 processes from any previously force-killed instance
+    # BEFORE launching the first child, so attempt 1 starts in a clean environment
+    # instead of being sacrificed to a deadlocked init and then silently retried.
+    try:
+        from platformdirs import user_data_dir
+        _wv_folder = str(Path(user_data_dir(appname='vd-desktop', appauthor='vd')) / 'webview2')
+    except Exception:
+        _wv_folder = str(Path.home() / '.vd-desktop' / 'webview2')
+    os.environ.setdefault('WEBVIEW2_USER_DATA_FOLDER', _wv_folder)
+    _n = _cleanupstalewebviewprocesses(_wv_folder)
+    if _n:
+        diag.log('app', f'killed {_n} stale WebView2 process(es) before first launch; '
+                        f'waiting for the OS to release the lock', 'warning')
+        time.sleep(1.5)
 
     # a unique flag file for this supervisor session; the UI child writes to it on load
     flag_fd, flag_path = tempfile.mkstemp(prefix='vd_wv_loaded_', suffix='.flag')
