@@ -55,3 +55,10 @@ yarn-error.log*
 *.tmp
 *.bak
 *.orig
+
+# ===== 调试残留（一次性诊断脚本/输出/PowerShell 误建文件）=====
+_t_*
+_test_*
+$null
+fix_*.py
+_fix_*.py
