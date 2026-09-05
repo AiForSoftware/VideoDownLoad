@@ -173,6 +173,19 @@ def _notify_already_running(focused: bool) -> None:
         pass
 
 
+def _pid_is_our_app(pid: int) -> bool:
+    '''True only if `pid` exists AND runs the same executable as ours.
+
+    Guards against a stale singleton.pid whose pid got recycled by an
+    unrelated system process (e.g. svchost): treating such a pid as
+    "another instance" made every launch wait 20s and then REFUSE to
+    start (the app could never open again until the pid was freed).'''
+    try:
+        return psutil.Process(int(pid)).name() == Path(sys.executable).name
+    except Exception:
+        return False
+
+
 def acquiresingleinstance() -> bool:
     '''Ensure a single instance WITHOUT killing healthy launches.
 
@@ -206,7 +219,7 @@ def acquiresingleinstance() -> bool:
                 oldpid = int(_singleton_pidfile.read_text(encoding='utf-8').strip() or '0')
             except Exception:
                 oldpid = 0
-            if oldpid and psutil.pid_exists(oldpid):
+            if oldpid and _pid_is_our_app(oldpid):
                 hwnd = _findwindow()
                 if hwnd and not _window_is_hung(hwnd):
                     diag.log('app', f'another instance (pid={oldpid}) is running and responsive; '
@@ -239,15 +252,15 @@ def acquiresingleinstance() -> bool:
                         if hwnd and not _window_is_hung(hwnd):
                             _up = True
                             break
-                        if not psutil.pid_exists(oldpid):
+                        if not _pid_is_our_app(oldpid):
                             break
                         time.sleep(0.5)
-                    if _up and psutil.pid_exists(oldpid):
+                    if _up and _pid_is_our_app(oldpid):
                         diag.log('app', f'previous instance (pid={oldpid}) window appeared; focusing it', 'info')
                         _focus_existing_window()
                         _notify_already_running(focused=True)
                         return False
-                    if psutil.pid_exists(oldpid):
+                    if _pid_is_our_app(oldpid):
                         # Still no window after 20s. Its own supervisor will kill and
                         # retry a hung WebView2 init — we must not fight it. Remind and
                         # exit so we never end up with two competing instances.

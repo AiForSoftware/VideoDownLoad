@@ -2,6 +2,7 @@
 Function:
     Implementation of DouyinVideoClient
 '''
+import copy
 import os
 import re
 import json
@@ -119,16 +120,36 @@ class DouyinVideoClient(BaseVideoClient):
             # (measured 718kbps). Explicit ratio values are resolution-matched
             # but bitrate-starved — that is why downloads looked much worse than
             # the in-app playback.
-            video_info.update(dict(download_url=(download_url := f"http://www.iesdouyin.com/aweme/v1/play/?video_id={play_uri}&ratio=default&line=0")))
             video_title = legalizestring(video_detail.get('desc') or null_backup_title, replace_null_string=null_backup_title).removesuffix('.')
-            guess_video_ext_result = FileTypeSniffer.getfileextensionfromurl(url=download_url, headers=self.default_download_headers, request_overrides=request_overrides, cookies=self.default_download_cookies, skip_urllib_parse=True)
-            ext = guess_video_ext_result['ext'] if guess_video_ext_result['ext'] and guess_video_ext_result['ext'] != 'NULL' else video_info.ext
-            video_info.update(dict(title=video_title, save_path=os.path.join(self.work_dir, self.source, f'{video_title}.{ext}'), ext=ext, guess_video_ext_result=guess_video_ext_result, identifier=vid, cover_url=safeextractfromdict(video_detail, ['video', 'cover', 'url_list', 0], None)))
+            # 画质档位枚举：ratio=default 是播放器主码率（最高清），但部分用户/场景
+            # 想要低清晰度片源（流量/体积优先），因此把 CDN 支持的低档 ratio 一并
+            # 枚举出来（每档一个 VideoInfo，探测可用才产出，对齐 B站/YouTube 的
+            # 每档一条契约；前端按画质后缀分组，用户可在下载前选择档位）。
+            # 注意 ratio=1080p 仍然禁止（那是低码率转码档，见上面的历史注释）。
+            video_infos = []
+            for _ratio, _label in (('default', '1080P'), ('720p', '720P'), ('540p', '540P')):
+                _vi = copy.deepcopy(video_info)
+                _u = f"http://www.iesdouyin.com/aweme/v1/play/?video_id={play_uri}&ratio={_ratio}&line=0"
+                _guess = FileTypeSniffer.getfileextensionfromurl(url=_u, headers=self.default_download_headers, request_overrides=request_overrides, cookies=self.default_download_cookies, skip_urllib_parse=True)
+                _ext = _guess['ext'] if _guess['ext'] and _guess['ext'] != 'NULL' else None
+                if not _ext: continue  # 该档 CDN 不可用（404/风控），直接剔除
+                _t = f'{video_title}_{_label}'
+                _vi.update(dict(download_url=_u, quality=_label, title=_t,
+                                save_path=os.path.join(self.work_dir, self.source, f'{_t}.{_ext}'),
+                                ext=_ext, guess_video_ext_result=_guess, identifier=f'{vid}-{_label}',
+                                cover_url=safeextractfromdict(video_detail, ['video', 'cover', 'url_list', 0], None)))
+                video_infos.append(_vi)
+            if not video_infos:
+                # default 档探测都被风控拦截时仍至少产出一条（URI 已验证存在）
+                _vi = copy.deepcopy(video_info)
+                _vi.update(dict(download_url=f"http://www.iesdouyin.com/aweme/v1/play/?video_id={play_uri}&ratio=default&line=0", quality='1080P', identifier=f'{vid}-default'))
+                video_infos.append(_vi)
         except Exception as err:
             video_info.update(dict(err_msg=(err_msg := f'{self.source}.parsefromurl >>> {url} (Error: {err})')))
             self.logger_handle.error(err_msg, disable_print=self.disable_print)
+            video_infos = [video_info]
         # return
-        return [video_info]
+        return video_infos
     '''_parsefromfeedapi'''
     def _parsefromfeedapi(self, vid: str, request_overrides: dict = None) -> dict:
         # amemv feed 接口无需任何签名/登录态。注意：该接口返回的是推荐流，

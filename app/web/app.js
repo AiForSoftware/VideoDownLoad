@@ -999,7 +999,7 @@ window.__prefillUrl = function (url) { $('urlInput').value = url; };
 
 /* ---------------- default quality selection ---------------- */
 function qualityRank(label) {
-    const map = { '8k': 5, '4k': 4, '1080p+': 3.5, '1080p60': 3.2, '1080p': 3, '720p60': 2.2, '720p': 2, '480p': 1, '360p': 0 };
+    const map = { '8k': 5, '4k': 4, '1080p+': 3.5, '1080p60': 3.2, '1080p': 3, '720p60': 2.2, '720p': 2, '540p': 1.5, '480p': 1, '360p': 0 };
     return map[String(label || '').toLowerCase()];
 }
 function pickDefaultQualitySelection(items, pref) {
@@ -1014,7 +1014,7 @@ function pickDefaultQualitySelection(items, pref) {
     const groups = {};
     for (const it of items) {
         if (!it.valid) continue;
-        const base = (it.title || '').replace(/[_-]?(4K|1080P\+?|1080P60|1080P|720P60|720P|480P|360P|8K)\s*$/i, '').trim() || it.title;
+        const base = (it.title || '').replace(/[_-]?(4K|1080P\+?|1080P60|1080P|720P60|720P|540P|480P|360P|8K)\s*$/i, '').trim() || it.title;
         (groups[base] = groups[base] || []).push(it);
     }
     const selected = new Set();

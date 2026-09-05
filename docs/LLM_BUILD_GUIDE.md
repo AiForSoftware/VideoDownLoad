@@ -97,6 +97,7 @@ dist\VideoDLDesktop\VideoDLDesktop.exe --selftest
 | 9 | **node 运行时按可选依赖打包** | spec 里 `import nodejs_wheel` 取 `node.exe` 打进 `nodejs_runtime/`；构建环境没装 `nodejs_wheel` 时打印 `node runtime not bundled` 并继续（不要当错误修）。 |
 | 10 | **★ 构建环境必须装 yt-dlp，否则音频合并悄然失效（2026-09-05 修复）** | `youtube.py` 对 yt_dlp 是**可选导入**（`try: import yt_dlp except: None`），而 spec 用 `collect_submodules('yt_dlp')` 打包——**构建 venv 没装 yt_dlp 时打包不报任何错**，只是产物里没有它（1046 个模块全部缺失）。后果链：解析期 `_apply_ytdlp_urls` 静默跳过 → 音频 URL 带加密 `n=` 参数 → 音频下载"先快后慢"卡在 ~98% 0B/s → 引擎放弃音频跳过音视频合并 → **成品无声**；且此时字幕封装照常运行，用户看到"字幕完成了、合并也出现了、就是没声音"的诡异时序。**构建前必须 `.venv\Scripts\pip install yt-dlp`**；验证法：用 `CArchiveReader+ZlibArchiveReader` 检查 PYZ 里 `yt_dlp` 模块数（正常 ~1000+，缺失=0）。 |
 | 11 | **PyInstaller 的 COLLECT 自清理同样会触发 SafeDelete 守卫** | 4.1#16 的 SafeDelete 问题不只影响手动 `Remove-Item`——PyInstaller 构建末期 `Removing dir dist\VideoDLDesktop`（COLLECT 阶段）也会命中 `SAFE_DELETE_BULK_CONFIRM_REQUIRED` 导致构建中止（build.log 末尾可见）。**只要预删除了 dist/build 再构建就不会触发**（COLLECT 只对自己新建的少量文件做清理）。绕过：`cmd /c rmdir /s /q dist\VideoDLDesktop`（注意 CodeBuddy 终端有时复用 cmd 上下文，用 cmd 语法 `cd /d ...`）。 |
+| 12 | **★ 唯一必须保留的 site-packages 补丁：WebView2 默认右键菜单（2026-09-05）** | pywebview `edgechromium.py` 写死 `settings.AreDefaultContextMenusEnabled = _state['debug']`——正式包（非 debug）右键菜单被禁，解析输入框无法右键复制/粘贴。补丁：该行改为 `= True`（源码内已留 `# PATCH (VideoDownLoad)` 注释标记）。**升级 pywebview 后必须重打**；除此一条外，4.1#6 的“废弃补丁”结论仍然成立（启动参数走环境变量，不靠补丁）。 |
 
 ### 4.2 进程 / 启动层（app.py）
 
@@ -106,7 +107,7 @@ dist\VideoDLDesktop\VideoDLDesktop.exe --selftest
 | 2 | **单实例守卫绝不能杀"健康"的已运行实例** | 旧逻辑"发现旧实例存活→杀掉"，叠加首启慢（Defender 扫描新构建文件），用户连点图标 = 每点一次杀掉启动到一半的进程，越点越慢。现逻辑（`acquiresingleinstance`）：① 旧实例存活且窗口响应（`IsHungAppWindow`）→ 聚焦其窗口（`FindWindowW`+`SetForegroundWindow`）+ **`MessageBoxW` 弹窗提醒"已在运行中请勿重复打开"**（`_notify_already_running`）+ 安静退出；② 旧实例存活但窗口**还没创建**（冷启动进行中）→ **绝不杀，等待最多 20s**，窗口出现则聚焦+提醒，20s 后仍无窗口则提醒退出（它自己的 supervisor 负责自愈）；③ 只有窗口真未响应（hung）才杀进程树。 |
 | 3 | **UI 子进程启动即隐藏，3 秒后原生早显示** | `webview.create_window(hidden=True)` 是防"白屏冻结窗口"的关键（supervised 时）。但全隐会让用户在冷启动 15s+ 里以为没点上 → 双击（见 #2 的旧事故）。折衷：`threading.Timer(3.0)` 触发 `_showwindowearly`，**必须用原生 `ctypes ShowWindow(hwnd, 5)`，绝不能用 pywebview 的 `window.show()`**（见 #6）；找不到 hwnd 每 0.5s 重试最多 10 次。加载成功后 `_showwindowwhenready` 再走 pywebview 正常 show（幂等，`_window_shown` Event 去重）。 |
 | 4 | **子进程黑框** | ffmpeg / N_m3u8DL-RE / aria2c / node 都是控制台程序，合并音视频时弹黑框。解法：`backend/core.py` 顶部给 `subprocess.Popen.__init__` 打了进程级补丁，未显式指定 `creationflags` 的子进程一律加 `CREATE_NO_WINDOW`。**勿删**。 |
-| 5 | **单实例 PID 文件** | `Logs\singleton.pid` 记录 supervisor PID。supervisor 正常退出时 atexit 释放；被强杀时残留——新守卫靠 `pid_exists` + 窗口响应检测兜底，不会死锁。 |
+| 5 | **单实例 PID 文件** | `Logs\singleton.pid` 记录 supervisor PID。supervisor 正常退出时 atexit 释放；被强杀时残留。**陷阱：PID 会被系统复用**（2026-09-05 实锤：残留 pid=6588 被复用给 svchost，`pid_exists` 永真 → 新实例等 20s 后退出 → 应用永远起不来）。修复：`_pid_is_our_app(pid)` 校验 pid 存在**且进程名与当前 exe 相同**才算“另一个实例”（守卫所有分支统一用它）；不符视为 stale，直接覆盖 pid 文件正常启动。 |
 | 6 | **★ pywebview `window.show()` 在 WebView2 初始化期间调用会死锁（2026-09-05 实测 100% 复现）** | `window.show()` 走 pywebview `_api_call` 装饰器 → WinForms `self.Invoke(...)` 同步封送到正忙于 WebView2 初始化的 UI 线程 → 初始化死锁、`events.loaded` 永不触发 → supervisor 误杀。实测：early-show 用 `window.show()` 的 attempt 全部挂死，未触发的 2-3s 加载。**早显示必须用原生 `ShowWindow(hwnd, 5)`**（不经过 pywebview 事件管线）。 |
 | 7 | **★ 诊断日志每行 `os.fsync()` 是启动隐形大头（2026-09-05 修复）** | `diag.py` 每条日志 flush+fsync，Defender 活跃期 fsync 实测 ~150ms/条，启动期 25+ 条 = **2~4s 纯日志税**；症状是日志行间 150-220ms 死间隔而每个 step 都报 `done in 0.0ms`（开销在日志本身）。修复：热路径只 `flush()`（进 OS 页缓存，进程崩溃/强杀不丢——法证场景足够），`fsync` 只留给 error/crash 级别。**勿加回每行 fsync**。 |
 | 8 | **★ parsed cache 不能在启动关键路径上加载（2026-09-05 修复）** | `VideoDlService.__init__` 同步 `_load_parsed_cache()` 时 `pickle.loads` 会反序列化 VideoInfo → 触发引擎模块导入（~0.4s），紧随的 prune 回写再 ~0.2s。现改为 daemon 线程 `_restoreparsedcachebg` 延迟 1s 后台执行（先 sleep 让 UI 页面加载不抢 GIL）。cache 只在 resume/重试时需要；加载完成前点"继续"只是重新解析（引擎 lazy load 本来就更慢），可接受退化。 |
@@ -253,7 +254,7 @@ dist\VideoDLDesktop\VideoDLDesktop.exe --selftest
 ## 7. 复刻清单（从零到当前形态的最短路径）
 
 1. Python 3.11 + `pip install -r requirements.txt`（含 pywebview、DrissionPage、PyInstaller）。
-2. ~~重打 pywebview site-packages 补丁~~ 已不需要：WebView2 启动参数已改为代码内环境变量（`setupwebviewdatafolder()` 设 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`，见 4.1#6），随代码走，pip 重装也不丢。
+2. pywebview 需重打一处 site-packages 补丁：`edgechromium.py` 的 `AreDefaultContextMenusEnabled = True`（右键菜单，见 4.1#12）；启动参数补丁已不需要（`setupwebviewdatafolder()` 设 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`，见 4.1#6）。
 3. 引擎包放 `engine/vd/`；剥掉 `modules/sources/__init__.py` 里的 eager import（懒加载前提），并设置 `VD_LAZY_PARSERS=1`。`modules/common/__init__.py` 的 `_EAGER_COMMON` 保持空列表（通用解析器已移除）。
 4. 按 `build.spec` 打包；确认 `[spec] packaged N non-python resource file(s)` 中 N > 0。
 5. 桌面壳按 4.2 实现：supervisor + hidden 窗口 + 加载标记文件 + 单实例聚焦/提醒（不杀启动中的实例）+ 原生 ShowWindow 早显示 + 存活探针双重确认 + WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS + CREATE_NO_WINDOW。
