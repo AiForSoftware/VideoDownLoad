@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from . import diag
-from .core import VideoDlService, defaultworkdir, HistoryStore
+from .core import VideoDlService, defaultworkdir, HistoryStore, Config
 
 try:  # webview is only available when running the desktop shell
     import webview
@@ -243,6 +243,9 @@ class JsApi():
     def cancel(self, job_id: str) -> Dict[str, Any]:
         return self.service.cancel(job_id)
 
+    def retryaudio(self, job_id: str) -> Dict[str, Any]:
+        return self.service.retry_audio(job_id)
+
     def clearjobs(self) -> Dict[str, Any]:
         return self.service.clearjobs()
 
@@ -318,7 +321,7 @@ class JsApi():
 
     def openconfigdir(self) -> Dict[str, Any]:
         '''Reveal the directory that stores the desktop config json.'''
-        return VideoDlService.openpath(str(VideoDlService.configpath().parent))
+        return VideoDlService.openpath(str(Config.configpath().parent))
 
     def history(self) -> Dict[str, Any]:
         return {'history': list(self.service.history)}

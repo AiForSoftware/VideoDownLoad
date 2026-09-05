@@ -24,7 +24,7 @@ from urllib import parse
 from functools import lru_cache
 from collections.abc import Sequence
 from datetime import datetime, timezone
-from urllib.request import Request, urlopen
+from urllib.request import Request, urlopen, build_opener, ProxyHandler
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse
 from ..js.youtube import JSInterpreter, extractplayerjsglobalvar
@@ -578,6 +578,13 @@ class _CurlResponseAdapter:
 '''RequestWrapper - uses curl_cffi for TLS fingerprint impersonation'''
 class RequestWrapper:
     default_range_size = 9437184
+    # Module-level proxy for ALL innertube/web requests issued through this
+    # wrapper. The GUI "proxy" setting reaches us via
+    # YouTubeVideoClient.parsefromurl -> RequestWrapper.set_proxy(); without
+    # this, parse-phase requests always went direct (the proxy only applied to
+    # downloads), which is exactly why a blocked IP kept failing even when a
+    # working proxy was configured in Settings.
+    _proxy_url = None
     # Parallel (multi-connection) download tuning for a single YouTube stream.
     # Splitting one file across several byte-range connections can multiply
     # throughput when the bottleneck is per-connection rate (the "推流速度"
@@ -611,6 +618,7 @@ class RequestWrapper:
             # Set YouTube consent cookies to bypass consent wall
             session.cookies.set('SOCS', 'CAISAQAD', domain='.youtube.com')
             session.cookies.set('CONSENT', 'YES+1', domain='.youtube.com')
+            RequestWrapper._apply_proxy(session)
             local.curl_session = session
             local.curl_available = True
             if not RequestWrapper._curl_init_logged:
@@ -625,6 +633,22 @@ class RequestWrapper:
                 RequestWrapper._curl_init_logged = True
             local.curl_available = False
             return None
+
+    '''Apply the configured proxy to a freshly created curl session'''
+    @staticmethod
+    def _apply_proxy(session):
+        if RequestWrapper._proxy_url:
+            session.proxies = {'http': RequestWrapper._proxy_url, 'https': RequestWrapper._proxy_url}
+        return session
+
+    '''Set (or clear, with ''/None) the module-level proxy; resets sessions so the
+    change takes effect on the next request.'''
+    @staticmethod
+    def set_proxy(url):
+        url = (url or '').strip() or None
+        if RequestWrapper._proxy_url == url: return
+        RequestWrapper._proxy_url = url
+        RequestWrapper.reset_curl_session()
 
     '''Reset the curl_cffi session(s) to clear poisoned cookies (call when LOGIN_REQUIRED)'''
     @staticmethod
@@ -656,6 +680,9 @@ class RequestWrapper:
         if data and not isinstance(data, bytes): data = bytes(json.dumps(data), encoding="utf-8")
         if url.lower().startswith("http"): request = Request(url, headers=base_headers, method=method, data=data)
         else: raise ValueError("Invalid URL")
+        if RequestWrapper._proxy_url:
+            proxy_opener = build_opener(ProxyHandler({'http': RequestWrapper._proxy_url, 'https': RequestWrapper._proxy_url}))
+            return proxy_opener.open(request, timeout=timeout)
         return urlopen(request, timeout=timeout)
     '''get'''
     @staticmethod

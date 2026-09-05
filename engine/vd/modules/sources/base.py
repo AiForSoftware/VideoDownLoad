@@ -5,6 +5,7 @@ Function:
 import os
 import re
 import copy
+import time
 import m3u8
 import random
 import base64
@@ -367,16 +368,61 @@ class BaseVideoClient(metaclass=AutoRegisterMeta):
         if video_info.audio_save_path: video_info.audio_save_path = self._ensureuniquefilepath(video_info.audio_save_path)
         request_overrides = dict(request_overrides or {}); touchdir(os.path.dirname(video_info.save_path))
         if video_info.audio_save_path: touchdir(os.path.dirname(video_info.audio_save_path))
-        # download video
+        # detach audio fields before dispatching downloads
         audio_download_url = video_info.pop('audio_download_url'); audio_save_path = video_info.pop('audio_save_path'); audio_ext = video_info.pop('audio_ext'); guess_audio_ext_result = video_info.pop('guess_audio_ext_result')
-        downloaded_video_infos: list[VideoInfo] = self._download(video_info=video_info, video_info_index=video_info_index, downloaded_video_infos=downloaded_video_infos, request_overrides=request_overrides, progress=progress)
-        downloaded_video_info = [dvi for dvi in downloaded_video_infos if (dvi.identifier == video_info.identifier)]
-        # download audio
         audio_info = VideoInfo(
             source=video_info.source, download_url=audio_download_url, save_path=audio_save_path, ext=audio_ext, identifier=f'audio-{video_info.identifier}', guess_video_ext_result=guess_audio_ext_result,
             default_download_headers=video_info.default_audio_download_headers, default_download_cookies=video_info.default_audio_download_cookies
         )
-        downloaded_audio_infos = self._download(video_info=audio_info, video_info_index=video_info_index, downloaded_video_infos=[], request_overrides=request_overrides, progress=progress)
+        # download video and audio concurrently. Previously audio was downloaded
+        # after video; a stuck audio stream would block completion and, if it
+        # failed entirely, caused an IndexError when merging.
+        def _streamreport(tag, infos, started, err):
+            '''Emit one log line per stream so the UI log shows that the audio
+            thread really ran, whether it succeeded, and at what speed.'''
+            dur = max(time.time() - started, 0.001)
+            size = 0
+            for i in (infos or []):
+                try: size += os.path.getsize(str(i.save_path))
+                except Exception: pass
+            if err is not None: state = f'FAILED ({err})'
+            elif not infos: state = 'FAILED (no output file)'
+            else: state = f'ok, {size / 1048576:.1f}MB in {dur:.1f}s ({size / 1048576 / dur:.2f} MB/s)'
+            self.logger_handle.info(f'{self.source}._downloadwithnaiveallinone >>> {tag} stream: {state}', disable_print=self.disable_print)
+        t_video, t_audio = time.time(), time.time()
+        self.logger_handle.info(f'{self.source}._downloadwithnaiveallinone >>> starting video + audio downloads concurrently', disable_print=self.disable_print)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            future_video = executor.submit(self._download, video_info=video_info, video_info_index=video_info_index, downloaded_video_infos=downloaded_video_infos, request_overrides=request_overrides, progress=progress)
+            future_audio = executor.submit(self._download, video_info=audio_info, video_info_index=video_info_index, downloaded_video_infos=[], request_overrides=request_overrides, progress=progress)
+            video_err = audio_err = None
+            try:
+                future_video.result()
+            except BaseException as err:
+                video_err = err; future_audio.cancel()
+            try:
+                downloaded_audio_infos = future_audio.result()
+            except BaseException as err:
+                audio_err = err; downloaded_audio_infos = []
+        _streamreport('video', [dvi for dvi in downloaded_video_infos if (dvi.identifier == video_info.identifier)], t_video, video_err)
+        _streamreport('audio', downloaded_audio_infos, t_audio, audio_err)
+        # pause/cancel must abort the whole item; any other failure falls through
+        # to the graceful handling below so one dead stream cannot lose the other
+        for err in (video_err, audio_err):
+            if err is not None and type(err).__name__ in ('DownloadPaused', 'DownloadCancelled'):
+                raise err
+        downloaded_video_info = [dvi for dvi in downloaded_video_infos if (dvi.identifier == video_info.identifier)]
+        # If either stream failed, do not crash with IndexError; return what we
+        # managed to download (usually the video-only file) so the user gets a
+        # concrete result and a clear error log instead of a bare traceback.
+        if not downloaded_video_info or not downloaded_audio_infos:
+            missing_parts = []
+            if not downloaded_video_info: missing_parts.append('video')
+            if not downloaded_audio_infos: missing_parts.append('audio')
+            self.logger_handle.error(f'{self.source}._downloadwithnaiveallinone >>> {"+".join(missing_parts)} download failed, skipping merge', disable_print=self.disable_print)
+            if downloaded_video_info:
+                downloaded_video_info[0].audio_download_url, downloaded_video_info[0].audio_save_path = audio_download_url, audio_save_path
+                downloaded_video_info[0].audio_ext, downloaded_video_info[0].guess_audio_ext_result = audio_ext, guess_audio_ext_result
+            return downloaded_video_infos
         # merge video and audio. Tracked as a packaging progress task so the UI
         # does not look frozen while ffmpeg muxes the two streams together.
         audio_save_path, audio_ext, video_save_path, ext = downloaded_audio_infos[0].save_path, downloaded_audio_infos[0].ext, downloaded_video_info[0].save_path, downloaded_video_info[0].ext
@@ -464,7 +510,15 @@ class BaseVideoClient(metaclass=AutoRegisterMeta):
                 resp = self.get(video_info.download_url, stream=True, verify=False, **request_overrides)
                 resp.raise_for_status()
             content_length, chunk_size = int(float(resp.headers.get("Content-Length", 0) or 0)), video_info.chunk_size
-            desc_name = f"[{video_info_index+1}] {os.path.basename(video_info.save_path)[:15] + '...'}" if len(os.path.basename(video_info.save_path)) > 15 else f"[{video_info_index+1}] {os.path.basename(video_info.save_path)[:15]}"
+            # An audio stream (downloaded concurrently with the video one by
+            # `_downloadwithnaiveallinone`) must be tagged as `audio`, otherwise
+            # the UI folds both streams into a single "video" progress row and the
+            # user cannot tell whether the audio is running/done at all.
+            _base = os.path.basename(video_info.save_path)
+            _is_audio = '.audio.' in _base or str(video_info.identifier or '').startswith('audio-')
+            _prefix = '音频 ' if _is_audio else ''
+            _name = _base[:15] + '...' if len(_base) > 15 else _base[:15]
+            desc_name = f"[{video_info_index+1}] {_prefix}{_name}"
             if start_byte > 0 and resp.status_code == 206 and content_length > 0:
                 total_bytes = start_byte + content_length
             elif content_length > 0:
@@ -472,7 +526,7 @@ class BaseVideoClient(metaclass=AutoRegisterMeta):
             else:
                 total_bytes = None
             downloaded_bytes = start_byte
-            video_task_id = progress.add_task(desc_name, total=total_bytes, completed=start_byte, kind="download")
+            video_task_id = progress.add_task(desc_name, total=total_bytes, completed=start_byte, kind=("audio" if _is_audio else "download"))
             mode = "ab" if start_byte > 0 else "wb"
             with open(part_path, mode) as fp:
                 for chunk in resp.iter_content(chunk_size=chunk_size):
@@ -602,22 +656,34 @@ class BaseVideoClient(metaclass=AutoRegisterMeta):
         out_ext = os.path.splitext(save_path)[1].lstrip('.').lower() or 'mkv'
         out = generateuniquetmppath(dir=work_dir, ext=out_ext)
         builder = CommandBuilder(ffmpeg).flag('-y')
-        builder.positional(save_path)
-        for _, p in downloaded: builder.positional(p)
+        # inputs MUST use -i: a bare positional is parsed by ffmpeg as an OUTPUT
+        # file, which left the command with zero inputs and failed with
+        # "Output file does not contain any stream" (subtitle mux never worked).
+        builder.opt('-i', save_path)
+        for _, p in downloaded: builder.opt('-i', p)
         builder.add('-map', '0')
         for i in range(len(downloaded)):
             builder.add('-map', str(i + 1))
+        # Copy video/audio streams; for MP4 the subtitle side-data must be
+        # transcoded to mov_text because WebVTT cannot be stored in MP4 as-is
+        # (a bare `-c copy` would silently drop the subtitle stream). MKV/WebM
+        # carry WebVTT natively, so they keep the copy.
         builder.add('-c', 'copy')
+        if out_ext in ('mp4', 'm4v'):
+            builder.add('-c:s', 'mov_text')
         for i, (lang, _) in enumerate(downloaded):
             builder.add(f'-metadata:s:s:{i}', f'language={lang}')
         builder.positional(out)
         # Mux the subtitles into the final video, tracked as a packaging phase.
         _mux_task = progress.add_task(f"封装字幕：{os.path.basename(save_path)[:15]}", total=None, kind="packaging") if progress is not None else None
         try:
-            subprocess.run(builder.tolist(), check=True, capture_output=(True if self.disable_print else False), text=True, encoding='utf-8', errors='ignore')
+            proc = subprocess.run(builder.tolist(), check=True, capture_output=True, text=True, encoding='utf-8', errors='ignore')
             shutil.move(out, save_path)
         except subprocess.CalledProcessError as err:
-            self.logger_handle.error(f'{self.source}._mux_subtitles >>> {save_path} (Error: {err})', disable_print=self.disable_print)
+            # include the ffmpeg stderr tail — without it a mux failure is
+            # undebuggable (the temp inputs are deleted in the finally below)
+            stderr_tail = (err.stderr or '')[-800:]
+            self.logger_handle.error(f'{self.source}._mux_subtitles >>> {save_path} (Error: {err}; ffmpeg stderr: {stderr_tail})', disable_print=self.disable_print)
             os.path.exists(out) and os.remove(out)
         finally:
             if progress is not None:

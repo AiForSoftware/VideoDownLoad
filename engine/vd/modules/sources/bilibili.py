@@ -136,6 +136,13 @@ class BilibiliVideoClient(BaseVideoClient):
             if prefix.upper() in ['AV']:
                 video_id = raw_data['data']['bvid']
             with taskprogress(description='Possible Multiple Videos Detected >>> Parsing One by One', total=len((extracted_video_items := raw_data['data']["pages"]))) as progress:
+                # Browser probe is EXPENSIVE (~10-60s of headless browsing) and only
+                # needs to run ONCE per URL: its job is to determine whether the
+                # logged-in front-end can produce dash for this video at all. Later
+                # parts reuse the much cheaper requests-based wbi-signed probe;
+                # without this cap a multi-part (multi-P) video would serially
+                # launch the browser once per part and parse for many minutes.
+                _browser_probe_done = False
                 for video_idx, extracted_video_item in enumerate(extracted_video_items):
                     if (part_id and video_idx + 1 != part_id) or (not isinstance(extracted_video_item, dict)): progress.advance(1); continue
                     # Quality enumeration: fetch the highest available quality
@@ -156,10 +163,13 @@ class BilibiliVideoClient(BaseVideoClient):
                     # skipped this for anon users, which is why the user saw
                     # "连 720p 都没有". On failure we still fall through to
                     # the requests-based dash/durl probes below.
-                    try:
-                        _ddata = self._fetch_playurl_via_browser(url, video_id, extracted_video_item['cid'], _cookies_bt, proxies=self._autosetproxies())
-                    except Exception as _e:
-                        self.logger_handle.error(f'{self.source}._parsefromcommonurl >>> browser probe failed ({_e})', disable_print=self.disable_print)
+                    if not _browser_probe_done:
+                        # browser route at most ONCE per URL (see comment above)
+                        _browser_probe_done = True
+                        try:
+                            _ddata = self._fetch_playurl_via_browser(url, video_id, extracted_video_item['cid'], _cookies_bt, proxies=self._autosetproxies())
+                        except Exception as _e:
+                            self.logger_handle.error(f'{self.source}._parsefromcommonurl >>> browser probe failed ({_e})', disable_print=self.disable_print)
                     # ---- 回退：requests 直接调 playurl（wbi 签名）----
                     if _ddata is None:
                         try:
@@ -376,6 +386,19 @@ class BilibiliVideoClient(BaseVideoClient):
             if not _bp:
                 self.logger_handle.warning('[DIAG bilibili] browser fetch SKIPPED: no system Chrome/Edge found; falling back to requests', disable_print=self.disable_print)
                 return None
+            def _cohook(co):
+                # --mute-audio: the headless player DOES autoplay (that autoplay is
+                # what fires the playurl XHR we intercept), but it must stay silent
+                # so the user never hears the parsed video playing in the background.
+                # --autoplay-policy: keep autoplay allowed even under stricter
+                # browser policies, otherwise the playurl XHR never fires.
+                try:
+                    DrissionPageUtils.safesetargument(co, '--mute-audio')
+                    DrissionPageUtils.safesetargument(co, '--autoplay-policy=no-user-gesture-required')
+                except Exception:
+                    pass
+                return co
+
             page = DrissionPageUtils.initsmartbrowser(
                 headless=True,
                 requests_cookies=_cookies_kv or None,
@@ -383,6 +406,7 @@ class BilibiliVideoClient(BaseVideoClient):
                 requests_proxies=proxies,
                 browser_path=_bp,
                 allow_download=False,
+                co_hook_func=_cohook,
             )
             # the CDP listener is only a FALLBACK: bilibili's risk-control bootstrap
             # fires the playurl XHR at unpredictable times (and the interception

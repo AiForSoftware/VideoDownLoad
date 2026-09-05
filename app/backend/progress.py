@@ -76,6 +76,15 @@ class ProgressBus():
         # and use it whenever the current thread has none.
         self._context = threading.local()
         self._fallback: Dict[str, Optional[str]] = {'job_id': None, 'item_key': None}
+        # Per-Progress-instance context. The engine spawns its own worker threads
+        # (video/audio download, ffmpeg merge) that have no thread-local context,
+        # so they previously fell back to the *global* `_fallback`, which is shared
+        # process-wide and gets overwritten by whichever job set context most
+        # recently — that is what made a concurrent job's merge bar show up inside
+        # a different job's card. Binding the context to the Progress instance at
+        # creation time (set by DesktopProgress.__init__) lets every task created
+        # by that Progress — on any thread — resolve to the correct job/item.
+        self._owner_ctx: Dict[str, tuple] = {}
 
     @classmethod
     def instance(cls) -> 'ProgressBus':
@@ -104,6 +113,21 @@ class ProgressBus():
         if job_id is not None or item_key is not None:
             return job_id, item_key
         return self._fallback['job_id'], self._fallback['item_key']
+
+    def current_context(self):
+        '''Public accessor used by DesktopProgress at construction time to bind
+        the freshly created Progress instance to whatever job/item is currently
+        running on the spawning thread.'''
+        return self._current_context()
+
+    def set_owner_context(self, owner: str, job_id, item_key) -> None:
+        '''Bind (job_id, item_key) to a Progress instance (`owner`). Every progress
+        task created by that instance resolves to this context regardless of which
+        thread (engine-spawned or not) creates it.'''
+        if job_id is None and item_key is None:
+            self._owner_ctx.pop(owner, None)
+        else:
+            self._owner_ctx[owner] = (job_id, item_key)
 
     def add_interrupt(self, key: str, func: Optional[Callable[[], bool]]) -> None:
         with self._lock:
@@ -151,6 +175,14 @@ class ProgressBus():
     def onadd(self, owner: str, task_id: Any, description: str, total: Optional[float], fields: Dict[str, Any]) -> None:
         key = f'{owner}:{task_id}'
         ctx_job, ctx_item = self._current_context()
+        # Prefer the Progress-instance binding: engine-spawned threads (video/audio
+        # download, ffmpeg merge) have no thread-local context and the global
+        # `_fallback` is shared across all concurrent jobs, so it can point at the
+        # wrong job. The owner binding is set once at Progress creation and is the
+        # authoritative context for every task this instance creates.
+        ob = self._owner_ctx.get(owner)
+        if (ctx_job is None and ctx_item is None) and ob:
+            ctx_job, ctx_item = ob
         with self._lock:
             self._tasks[key] = {
                 'key': key, 'description': str(description), 'completed': 0.0, 'total': total,
@@ -165,6 +197,9 @@ class ProgressBus():
             item = self._tasks.get(key)
             if item is None:
                 ctx_job, ctx_item = self._current_context()
+                ob = self._owner_ctx.get(owner)
+                if (ctx_job is None and ctx_item is None) and ob:
+                    ctx_job, ctx_item = ob
                 item = {
                     'key': key, 'description': '', 'completed': 0.0, 'total': None,
                     'kind': 'download', 'speed': None, 'finished': False,
@@ -187,8 +222,11 @@ class ProgressBus():
                 item['completed'] = float(getattr(task, 'completed', 0.0) or 0.0)
                 item['total'] = getattr(task, 'total', item['total'])
                 item['finished'] = bool(getattr(task, 'finished', False))
+                # 'audio' streams are byte-based just like 'download' ones and must
+                # report a speed too; 'm3u8download' counts segments (not bytes) so
+                # its "speed" would be meaningless in the byte-based totals.
                 try:
-                    item['speed'] = task.speed if item['kind'] == 'download' else None
+                    item['speed'] = task.speed if item['kind'] in ('download', 'audio') else None
                 except Exception:
                     item['speed'] = None
                 fields = getattr(task, 'fields', None) or {}
@@ -267,6 +305,16 @@ class DesktopProgress(RichProgress):
         kwargs.setdefault('console', Console(file=NullFile(), width=120, quiet=True, no_color=True))
         super(DesktopProgress, self).__init__(*columns, **kwargs)
         self._owner = f'p{id(self):x}'
+        # Bind this Progress instance to whatever job/item is running on the
+        # spawning thread right now. Every task created by this instance — on any
+        # thread, including engine-spawned merge/audio workers — then resolves to
+        # the correct job/item, so a concurrent job's merge bar can no longer land
+        # inside a different job's card.
+        try:
+            bus = ProgressBus.instance()
+            bus.set_owner_context(self._owner, *bus.current_context())
+        except Exception:
+            pass
 
     def start(self) -> None:
         return None

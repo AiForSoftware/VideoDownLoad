@@ -78,25 +78,36 @@ class DouyinVideoClient(BaseVideoClient):
                     break
                 _last_diag = f'{_src} 返回数据但不含 play_addr.uri（通常需要先登录抖音）'
             if raw_data is None:
-                _alt = f"https://www.douyin.com/video/{vid}" if vid else ''
-                _hint_parts = []
-                if '/jingxuan' in url or 'modal_id' in url:
-                    _hint_parts.append('当前是 jingxuan 模态页，已优先按主站解析并回退 iesdouyin 分享页')
-                _hint_parts.append('均未能取到 play_addr.uri，通常是未登录抖音被反爬/数据裁剪')
-                if _alt:
-                    _hint_parts.append(f'请先在【设置】页登录抖音后重试，或复制直链：{_alt}')
-                _hint = '（' + '；'.join(_hint_parts) + '）'
-                raise RuntimeError(f'未能从抖音页面提取到 video.play_addr.uri{_hint}。诊断: {_last_diag}')
-            # 已确认 raw_data 含有效 play_addr，提取 video_detail
-            loader_data = safeextractfromdict(raw_data, ['loaderData'], {}) or {}
-            video_detail = {}
-            for _k, _v in loader_data.items():
-                if not isinstance(_v, dict): continue
-                _vir = _v.get('videoInfoRes')
-                if isinstance(_vir, dict):
-                    _items = _vir.get('item_list') or _vir.get('video_list') or []
-                    if _items: video_detail = _items[0] or {}; break
-                if _v.get('aweme_detail'): video_detail = _v.get('aweme_detail') or {}; break
+                # 兜底：amemv feed 接口（无需签名/登录）。分享页与主站在未登录时
+                # 都会被反爬裁剪数据，但该接口直接返回完整 aweme_list（含
+                # play_addr.uri），是不依赖登录态的可用解析路径。
+                try:
+                    video_detail = self._parsefromfeedapi(vid, request_overrides)
+                except Exception as _e:
+                    video_detail = {}
+                    self.logger_handle.error(f'amemv feed 兜底解析失败: {_e}', disable_print=self.disable_print)
+                _feed_uri = (((video_detail.get('video') or {}).get('play_addr') or {}).get('uri') or (video_detail.get('play_addr') or {}).get('uri'))
+                if not _feed_uri:
+                    _alt = f"https://www.douyin.com/video/{vid}" if vid else ''
+                    _hint_parts = []
+                    if '/jingxuan' in url or 'modal_id' in url:
+                        _hint_parts.append('当前是 jingxuan 模态页，已优先按主站解析并回退 iesdouyin 分享页')
+                    _hint_parts.append('主站/分享页/feed 接口均未能取到 play_addr.uri，通常是未登录抖音被反爬/数据裁剪')
+                    if _alt:
+                        _hint_parts.append(f'请先在【设置】页登录抖音后重试，或复制直链：{_alt}')
+                    _hint = '（' + '；'.join(_hint_parts) + '）'
+                    raise RuntimeError(f'未能从抖音页面提取到 video.play_addr.uri{_hint}。诊断: {_last_diag}')
+            else:
+                # 已确认 raw_data 含有效 play_addr，提取 video_detail
+                loader_data = safeextractfromdict(raw_data, ['loaderData'], {}) or {}
+                video_detail = {}
+                for _k, _v in loader_data.items():
+                    if not isinstance(_v, dict): continue
+                    _vir = _v.get('videoInfoRes')
+                    if isinstance(_vir, dict):
+                        _items = _vir.get('item_list') or _vir.get('video_list') or []
+                        if _items: video_detail = _items[0] or {}; break
+                    if _v.get('aweme_detail'): video_detail = _v.get('aweme_detail') or {}; break
             play_uri = ((video_detail.get('video') or {}).get('play_addr') or {}).get('uri') \
                 or ((video_detail.get('play_addr') or {}).get('uri'))
             if not play_uri:
@@ -118,8 +129,22 @@ class DouyinVideoClient(BaseVideoClient):
             self.logger_handle.error(err_msg, disable_print=self.disable_print)
         # return
         return [video_info]
+    '''_parsefromfeedapi'''
+    def _parsefromfeedapi(self, vid: str, request_overrides: dict = None) -> dict:
+        # amemv feed 接口无需任何签名/登录态。注意：该接口返回的是推荐流，
+        # 目标视频命中时会排在首位，但绝不能在未命中时回落到首条（会静默
+        # 返回无关视频），必须严格按 aweme_id 精确匹配。
+        request_overrides = request_overrides or {}
+        feed_url = (f"https://api3-normal-c-lf.amemv.com/aweme/v1/feed/?aweme_id={vid}"
+                    f"&version_code=26.2.0&app_name=aweme&channel=App+Store"
+                    f"&device_type=iPhone&device_platform=iphone&os_version=16.0&aid=1128")
+        (resp := self.get(feed_url, **request_overrides)).raise_for_status()
+        aweme_list = resp.json().get('aweme_list') or []
+        for item in aweme_list:
+            if (item.get('aweme_id') or '') == vid: return item
+        return {}
     '''belongto'''
     @staticmethod
     def belongto(url: str, valid_domains: list[str] | set[str] = None):
-        valid_domains = set(valid_domains or []) | {"douyin.com"}
+        valid_domains = set(valid_domains or []) | {"douyin.com", "iesdouyin.com", "douyinvod.com", "amemv.com"}
         return BaseVideoClient.belongto(url, valid_domains)

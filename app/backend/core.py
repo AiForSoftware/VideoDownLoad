@@ -14,6 +14,7 @@ import pickle
 import re
 import sys
 import json
+import shutil
 import queue
 import logging
 import threading
@@ -108,7 +109,7 @@ DEFAULT_ALLOWED_SOURCES = ['DouyinVideoClient', 'BilibiliVideoClient', 'YouTubeV
 class Config():
     work_dir: str = field(default_factory=defaultworkdir)
     num_threadings: int = 5
-    concurrent_downloads: int = 2
+    concurrent_downloads: int = 1
     proxy: str = ''
     cookies: str = ''
     # per-source login cookies captured via the in-app login window (DrissionPage).
@@ -328,10 +329,24 @@ class VideoDlService():
         # (shown but not started); the user starts them via the per-job
         # "开始/继续" button, which re-parses and resumes. See `_load_jobs`.
         self._load_jobs()
-        # Restore parsed VideoInfo cache only for the jobs that survived the
-        # restart filter, then immediately prune stale entries from disk.
-        self._load_parsed_cache()
-        self._save_parsed_cache()
+        # Restore the parsed VideoInfo cache OFF the startup critical path:
+        # unpickling it pulls in engine modules (~0.4s of imports) and the
+        # follow-up prune-and-save adds another ~0.2s. The cache is only needed
+        # when the user resumes/retries a paused job, so load it in a daemon
+        # thread shortly after boot — until then a resume just re-parses (the
+        # lazy engine load costs more than that anyway).
+        threading.Thread(target=self._restoreparsedcachebg, name='parsed-cache-loader', daemon=True).start()
+
+    def _restoreparsedcachebg(self) -> None:
+        '''Background twin of the old synchronous load+prune parsed-cache boot
+        step (see __init__). Sleeps a moment first so the UI page load never
+        competes with it for the GIL.'''
+        try:
+            time.sleep(1.0)
+            self._load_parsed_cache()
+            self._save_parsed_cache()
+        except Exception as err:
+            diag.log('core', f'background parsed cache restore failed: {err}', 'warning')
 
     @property
     def _effective_concurrent(self) -> int:
@@ -1382,6 +1397,194 @@ class VideoDlService():
         self._save_parsed_cache()
         return {'ok': True, 'removed': len(finished)}
 
+    '''-------------------- retry audio (补音频 / 重新合并) --------------------'''
+
+    def retry_audio(self, job_id: str) -> Dict[str, Any]:
+        '''Re-download just the audio for a finished item and merge it with the
+        already-downloaded video file. This avoids re-parsing the page (which
+        YouTube may rate-limit) by reusing the cached VideoInfo plus a fresh
+        yt-dlp-resolved (n-decrypted) audio url.'''
+        with self._jobs_lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return {'ok': False, 'error': '任务不存在'}
+            item = next((it for it in job['items'] if it['status'] in ('error', 'done')), None) or (job['items'][0] if job['items'] else None)
+            if item is None:
+                return {'ok': False, 'error': '该任务没有可处理的条目'}
+            video_path = str(item.get('save_path') or '')
+            if not video_path or not os.path.exists(video_path):
+                return {'ok': False, 'error': '视频文件不存在，无法补音频，请重新下载整个任务'}
+        with self._parsed_lock:
+            video_info = self._parsed.get(item['key'])
+        if video_info is None:
+            return {'ok': False, 'error': '解析缓存已失效，请回到主页重新解析链接后再补音频'}
+        source = str(getattr(video_info, 'source', '') or '')
+        client = self._get_or_build_job_client(job_id, source)
+        if client is None:
+            return {'ok': False, 'error': self._import_error or '引擎不可用，无法补音频'}
+        # Nothing to do if the video already carries an audio track.
+        if self._video_has_audio(video_path):
+            with self._jobs_lock:
+                live = self._jobs.get(job_id)
+                if live is not None:
+                    it = next((x for x in live['items'] if x['key'] == item['key']), None)
+                    if it is not None:
+                        it['status'] = 'done'; it['error'] = ''
+                    self._update_job_status(live)
+                    self._save_jobs()
+            return {'ok': True, 'already': True, 'message': '该视频已包含音频，无需补录'}
+        with self._jobs_lock:
+            if job.get('status') not in ('done', 'error'):
+                return {'ok': False, 'error': '该任务正在运行，无法补音频'}
+            job['status'] = 'downloading'
+            for it in job['items']:
+                if it['key'] == item['key'] and it['status'] in ('done', 'error'):
+                    it['status'] = 'downloading'; it['error'] = ''
+            self._save_jobs()
+        threading.Thread(target=self._retry_audio_worker, args=(job_id, item['key'], video_path, video_info, client),
+                         name=f'retryaudio-{job_id}', daemon=True).start()
+        return {'ok': True, 'async': True}
+
+    def _retry_audio_worker(self, job_id: str, item_key: str, video_path: str, video_info, client) -> None:
+        try:
+            ok, msg = self._download_audio_and_merge(job_id, item_key, video_path, video_info, client)
+        except Exception as err:
+            ok, msg = False, str(err)
+            self.log('error', f'[{job_id}] retry_audio crashed: {err}')
+            self.log('debug', traceback.format_exc())
+        with self._jobs_lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return
+            item = next((it for it in job['items'] if it['key'] == item_key), None)
+            if item is not None:
+                item['status'] = 'done' if ok else 'error'
+                item['error'] = '' if ok else msg
+            self._update_job_status(job)
+            self._save_jobs()
+
+    def _video_has_audio(self, path: str) -> bool:
+        try:
+            from vd.modules.utils.cmd import MergeVideoAudioCopyFFmpegCommand
+            return bool(MergeVideoAudioCopyFFmpegCommand.hasaudiostream(path))
+        except Exception:
+            return False
+
+    def _resolve_fresh_audio_url(self, video_info, client) -> str:
+        '''For YouTube, refresh the audio googlevideo url via yt-dlp (n-decrypted),
+        keyed by its itag, so the audio is not downloaded through the throttled
+        raw `n=` url that caused the original failure.'''
+        source = str(getattr(video_info, 'source', '') or '')
+        if source != 'YouTubeVideoClient':
+            return ''
+        try:
+            import re
+            # identifier is "{vid}-{quality}"; quality labels never contain '-',
+            # so rsplit is safe even when the video id itself contains '-'.
+            vid = str(getattr(video_info, 'identifier', '') or '').rsplit('-', 1)[0]
+            if not vid:
+                return ''
+            yt_client = self._sourceclient('YouTubeVideoClient', client)
+            if yt_client is None or not hasattr(yt_client, '_resolve_via_ytdlp'):
+                return ''
+            mapping = yt_client._resolve_via_ytdlp(vid)
+            if not mapping:
+                return ''
+            aurl = str(getattr(video_info, 'audio_download_url', '') or '')
+            m = re.search(r'[?&]itag=(\d+)', aurl)
+            itag = m.group(1) if m else ''
+            if itag and itag in mapping:
+                return mapping[itag]
+            # no matching itag: the vid extraction (or the extraction itself) went
+            # wrong — do NOT fall through to the throttled url below.
+            self.log('warning', f'fresh audio url refresh returned no itag {itag} match (vid={vid[:12]})')
+        except Exception as e:
+            self.log('warning', f'refresh audio url via yt-dlp failed: {e}')
+        return ''
+
+    def _download_audio_and_merge(self, job_id: str, item_key: str, video_path: str, video_info, client) -> tuple:
+        '''Download a fresh audio stream and mux it onto the existing video file.'''
+        from vd.modules.utils.cmd import (
+            MergeVideoAudioAudioTranscodeFFmpegCommand,
+            MergeVideoAudioFullTranscodeFFmpegCommand,
+            MergeVideoAudioCopyFFmpegCommand,
+        )
+        from vd.modules.utils.io import generateuniquetmppath
+        from vd.modules.utils import VideoInfo
+
+        source = str(getattr(video_info, 'source', '') or '')
+        work_dir = self.config.work_dir
+        audio_ext = str(getattr(video_info, 'audio_ext', '') or 'm4a') or 'm4a'
+        audio_save_path = str(getattr(video_info, 'audio_save_path', '') or '')
+        if not audio_save_path:
+            audio_save_path = os.path.join(os.path.dirname(video_path), f'{Path(video_path).stem}.audio.{audio_ext}')
+        # Kill any stale progress tasks left by a previous attempt (e.g. an audio
+        # download that stalled at 98%) BEFORE starting — otherwise the UI stacks
+        # the new progress bars on top of the old unfinished ones.
+        try:
+            self.bus.finish_tasks_for(job_id, item_key)
+        except Exception:
+            pass
+        audio_url = str(getattr(video_info, 'audio_download_url', '') or '')
+        fresh = self._resolve_fresh_audio_url(video_info, client)
+        if fresh:
+            audio_url = fresh
+        elif source == 'YouTubeVideoClient' and 'n=' in audio_url:
+            # the raw url still carries the encrypted throttle param and the
+            # yt-dlp refresh failed — crawling it would stall at ~50% 0B/s.
+            return False, '音频直链仍被 YouTube 限速（解密刷新失败），请稍后再点“补音频”'
+        if not audio_url:
+            return False, '缺少可用音频地址，无法补音频'
+        audio_info = VideoInfo(
+            source=source,
+            download_url=audio_url,
+            save_path=audio_save_path,
+            ext=audio_ext,
+            identifier=f'audio-retry-{getattr(video_info, "identifier", "") or item_key}',
+            default_download_headers=getattr(video_info, 'default_audio_download_headers', None),
+            default_download_cookies=getattr(video_info, 'default_audio_download_cookies', None),
+        )
+        self.bus.set_context(job_id, item_key)
+        try:
+            downloaded = self.downloadvideoinfo(audio_info, client) or []
+        finally:
+            self.bus.clear_context()
+        if not downloaded:
+            return False, '音频下载失败（可能仍被 YouTube 限速，请稍后切换网络再点“补音频”）'
+        audio_file = downloaded[0].save_path
+        ext = os.path.splitext(video_path)[1].lstrip('.') or 'mp4'
+        tmp_out = generateuniquetmppath(dir=os.path.join(work_dir, source or 'vd'), ext=ext)
+        merged = False
+        for factory in (MergeVideoAudioAudioTranscodeFFmpegCommand, MergeVideoAudioFullTranscodeFFmpegCommand, MergeVideoAudioCopyFFmpegCommand):
+            cmd = factory().build(video_file_path=video_path, audio_file_path=audio_file,
+                                  output_file_path=tmp_out, mods=getattr(video_info, 'ffmpeg_settings', None))
+            try:
+                subprocess.run(cmd, check=True, capture_output=True, text=True, encoding='utf-8', errors='ignore')
+            except subprocess.CalledProcessError as err:
+                self.log('warning', f'[{job_id}] merge via {factory.__name__} failed: {err}')
+                continue
+            if MergeVideoAudioCopyFFmpegCommand.hasaudiostream(tmp_out) or (not shutil.which('ffprobe')):
+                merged = True
+                break
+        if not merged:
+            if os.path.exists(tmp_out):
+                os.remove(tmp_out)
+            return False, '音频已下载，但合并失败（ffmpeg 报错）'
+        backup = video_path + '.silentbak'
+        try:
+            if os.path.exists(backup):
+                os.remove(backup)
+            os.replace(video_path, backup)
+        except Exception:
+            backup = None
+        shutil.move(tmp_out, video_path)
+        if backup and os.path.exists(backup):
+            os.remove(backup)
+        if os.path.exists(audio_file):
+            os.remove(audio_file)
+        self.log('info', f'[{job_id}] 已成功补录音频并重新合并: {video_path}')
+        return True, '已成功补录音频并重新合并'
+
     def shutdown(self) -> None:
         '''Best-effort clean shutdown used when the window is closed.
 
@@ -1592,7 +1795,58 @@ class VideoDlService():
 
     '''-------------------- state --------------------'''
 
+    def _streams_done_for(self, job_id: str, item_key: str) -> int:
+        '''How many of an in-flight item's streams (video/audio/segments) have
+        fully downloaded, according to the live progress bus.
+
+        The persisted ``done_count`` only advances when a whole ITEM finishes
+        (video + audio + merge), which made the header sit at "0/2" for the
+        entire download. Counting completed stream tasks gives the counter
+        partial credit: video done -> "1/2", audio done too -> "2/2".'''
+        done = 0
+        for t in self.bus.snapshot():
+            if t.get('job_id') != job_id or t.get('item_key') != item_key:
+                continue
+            if t.get('kind') not in ('download', 'audio', 'm3u8download'):
+                continue
+            total, completed = t.get('total'), t.get('completed') or 0
+            try:
+                if total and float(completed) >= float(total):
+                    done += 1
+            except Exception:
+                continue
+        return done
+
     def jobsnapshot(self) -> List[Dict[str, Any]]:
+        # Self-healing sweep: if a job was left in a transient state (cancelling /
+        # pausing) but every item has reached a terminal status and no worker will
+        # ever re-derive its status (e.g. the retry-audio thread died between the
+        # download finishing and the status update), finalize it here so the UI
+        # never sticks on 取消中/暂停中 forever. Only *transient* statuses are
+        # touched; terminal ones are left untouched for the X-remove button.
+        stale = []
+        with self._jobs_lock:
+            for job in self._jobs.values():
+                if job.get('status') == 'cancelling' and job.get('cancel_event') and job['cancel_event'].is_set():
+                    if all(it['status'] in ('cancelled', 'done', 'error') for it in job['items']):
+                        job['status'] = 'cancelled'
+                        job['finished_at'] = job.get('finished_at') or datetime.now().strftime('%H:%M:%S')
+                        self._save_jobs()
+                elif job.get('status') == 'pausing' and all(it['status'] in ('paused', 'done', 'error', 'cancelled') for it in job['items']):
+                    job['status'] = 'paused'
+                    self._save_jobs()
+                elif job.get('status') in ('downloading',) :
+                    # a job stuck 'downloading' with every item terminal and no
+                    # live futures is equally dead (e.g. a crashed retry worker)
+                    if all(it['status'] in ('done', 'error', 'cancelled') for it in job['items']):
+                        stale.append(job)
+            for job in stale:
+                with self._futures_lock:
+                    has_live = any(jid == job['id'] for jid, _ in self._futures.values())
+                if not has_live:
+                    job['status'] = 'error' if any(it['status'] == 'error' for it in job['items']) else 'done'
+                    job['finished_at'] = job.get('finished_at') or datetime.now().strftime('%H:%M:%S')
+                    self._save_jobs()
         with self._jobs_lock:
             jobs = list(self._jobs.values())
         result = []
@@ -1604,10 +1858,20 @@ class VideoDlService():
                 }
                 for i in job['items']
             ]
+            done_count = job.get('done_count', 0)
+            if job.get('status') == 'downloading':
+                # add partial credit from in-flight items (never above their
+                # subtask_count, so retried stream tasks cannot inflate it;
+                # finished items are already inside done_count)
+                partial = 0
+                for it in job['items']:
+                    if it['status'] in ('queued', 'downloading', 'pausing', 'paused'):
+                        partial += min(it.get('subtask_count', 1), self._streams_done_for(job['id'], it['key']))
+                done_count = max(done_count, partial)
             result.append({
                 'id': job['id'], 'status': job['status'], 'error': job['error'], 'work_dir': job['work_dir'],
                 'created_at': job['created_at'], 'started_at': job['started_at'], 'finished_at': job['finished_at'],
-                'done_count': job['done_count'], 'total_count': job['total_count'],
+                'done_count': done_count, 'total_count': job['total_count'],
                 'url': job.get('url', ''), 'items': items_meta,
             })
         result.reverse()

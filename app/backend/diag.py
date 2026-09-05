@@ -82,12 +82,18 @@ def log(scope: str, message: str, level: str = 'info') -> None:
             _rotateifneeded()
             with open(logpath(), 'a', encoding='utf-8') as fp:
                 fp.write(line + '\n')
-                # Flush immediately: startup.log is the forensic record of a hang, and
-                # a hang usually ends with the process being force-killed — without an
-                # explicit flush the last (most important) lines would be lost in the
-                # write buffer and the diagnosis would be incomplete.
+                # Flush (NOT fsync) on the hot path: flush pushes the line into
+                # the OS page cache, which survives process crashes and force-
+                # kills — the exact forensic scenario this log exists for. The
+                # old per-line os.fsync() measured ~150ms per call under
+                # Defender activity, taxing every launch ~2-4s across the ~25
+                # startup lines (they showed up as dead 150-220ms gaps BETWEEN
+                # log lines while every step reported "done in 0.0ms"). fsync
+                # is now reserved for error/crash lines where durability
+                # actually matters.
                 fp.flush()
-                os.fsync(fp.fileno())
+                if level in ('error', 'crash'):
+                    os.fsync(fp.fileno())
         except Exception:
             pass
     if os.environ.get('VD_DESKTOP_DEBUG'):

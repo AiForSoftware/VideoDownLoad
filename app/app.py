@@ -152,6 +152,27 @@ def _window_is_hung(hwnd) -> bool:
         return False
 
 
+def _findwindow() -> int:
+    '''HWND of this app's main window (0 when not created or already closed).'''
+    try:
+        import ctypes
+        return ctypes.windll.user32.FindWindowW(None, f'{APP_NAME} v{APP_VERSION}') or 0
+    except Exception:
+        return 0
+
+
+def _notify_already_running(focused: bool) -> None:
+    '''Native reminder popup: the app is already running — do not open it twice.'''
+    try:
+        import ctypes
+        msg = ('全能下载器已在运行中，请勿重复打开。\n'
+               + ('已为你切换到已打开的窗口。' if focused else '请查看任务栏中已打开的应用窗口。'))
+        # MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST
+        ctypes.windll.user32.MessageBoxW(0, msg, APP_NAME, 0x40 | 0x10000 | 0x40000)
+    except Exception:
+        pass
+
+
 def acquiresingleinstance() -> bool:
     '''Ensure a single instance WITHOUT killing healthy launches.
 
@@ -163,8 +184,13 @@ def acquiresingleinstance() -> bool:
 
     New behaviour:
       * no previous instance  -> acquire the lock and start normally;
-      * previous instance alive and its window responds -> focus it, exit quietly;
-      * previous instance alive but genuinely hung (IsHungAppWindow) -> kill its
+      * previous instance alive and its window responds -> focus it, show a
+        "already running, do not open twice" reminder and exit quietly;
+      * previous instance alive but its window does NOT exist yet -> it is a
+        cold start in progress, never kill it. Wait up to 20s for the window to
+        appear, then either focus it (and remind) or exit quietly — its own
+        supervisor is responsible for recovering a genuinely hung init;
+      * previous instance alive with a HUNG window (IsHungAppWindow) -> kill its
         whole process tree and start fresh (the old recovery, now precise).'''
     global _singleton_pidfile
     try:
@@ -181,27 +207,54 @@ def acquiresingleinstance() -> bool:
             except Exception:
                 oldpid = 0
             if oldpid and psutil.pid_exists(oldpid):
-                hwnd = None
-                try:
-                    import ctypes
-                    hwnd = ctypes.windll.user32.FindWindowW(None, f'{APP_NAME} v{APP_VERSION}') or None
-                except Exception:
-                    hwnd = None
-                if hwnd is not None and not _window_is_hung(hwnd):
+                hwnd = _findwindow()
+                if hwnd and not _window_is_hung(hwnd):
                     diag.log('app', f'another instance (pid={oldpid}) is running and responsive; '
                                     f'focusing its window and exiting', 'info')
                     _focus_existing_window()
+                    _notify_already_running(focused=True)
                     return False
-                diag.log('app', f'another instance (pid={oldpid}) is running but hung; '
-                                f'terminating it to recover', 'warning')
-                try:
-                    proc = psutil.Process(oldpid)
-                    for child in proc.children(recursive=True):
-                        try: child.kill()
-                        except Exception: pass
-                    proc.kill()
-                except Exception as err:
-                    diag.log('app', f'failed to terminate previous instance pid={oldpid}: {err}', 'warning')
+                if hwnd and _window_is_hung(hwnd):
+                    diag.log('app', f'another instance (pid={oldpid}) is running but hung; '
+                                    f'terminating it to recover', 'warning')
+                    try:
+                        proc = psutil.Process(oldpid)
+                        for child in proc.children(recursive=True):
+                            try: child.kill()
+                            except Exception: pass
+                        proc.kill()
+                    except Exception as err:
+                        diag.log('app', f'failed to terminate previous instance pid={oldpid}: {err}', 'warning')
+                else:
+                    # Window not created yet: a cold start is in progress (WebView2 init
+                    # on a cold boot can take 15-30s). Killing it here is exactly what
+                    # made repeated double-clicks "unstart" the app. Wait briefly for
+                    # the window to come up, then remind the user instead of racing it.
+                    diag.log('app', f'another instance (pid={oldpid}) is starting (no window yet); '
+                                    f'waiting for it to come up instead of killing it', 'info')
+                    _deadline = time.monotonic() + 20
+                    _up = False
+                    while time.monotonic() < _deadline:
+                        hwnd = _findwindow()
+                        if hwnd and not _window_is_hung(hwnd):
+                            _up = True
+                            break
+                        if not psutil.pid_exists(oldpid):
+                            break
+                        time.sleep(0.5)
+                    if _up and psutil.pid_exists(oldpid):
+                        diag.log('app', f'previous instance (pid={oldpid}) window appeared; focusing it', 'info')
+                        _focus_existing_window()
+                        _notify_already_running(focused=True)
+                        return False
+                    if psutil.pid_exists(oldpid):
+                        # Still no window after 20s. Its own supervisor will kill and
+                        # retry a hung WebView2 init — we must not fight it. Remind and
+                        # exit so we never end up with two competing instances.
+                        diag.log('app', f'previous instance (pid={oldpid}) still has no window after 20s; '
+                                        f'exiting to avoid a duplicate instance', 'warning')
+                        _notify_already_running(focused=False)
+                        return False
         _singleton_pidfile.write_text(str(os.getpid()), encoding='utf-8')
         import atexit
         atexit.register(_releasesingleton)
@@ -246,6 +299,18 @@ def setupwebviewdatafolder() -> None:
         diag.log('app', f'webview2 user data folder: {folder}')
     except Exception as err:
         diag.log('app', f'failed to prepare webview2 data folder: {err}', 'warning')
+    # Trim WebView2's startup work: the loader honors this env var with higher
+    # priority than pywebview's programmatic AdditionalBrowserArguments, so the
+    # ElasticOverscroll feature-disable pywebview sets is folded in here.
+    # Measured pain points on cold start: component-update fetches, background
+    # networking and SmartScreen checks each add seconds (or hang on a flaky
+    # network) BEFORE the first navigation even begins.
+    os.environ['WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS'] = (
+        '--disable-component-update --disable-background-networking '
+        '--disable-domain-reliability --disable-sync --no-first-run --noerrdialogs '
+        '--disable-features=ElasticOverscroll,msSmartScreenProtection'
+    )
+    diag.log('app', 'webview2 startup args: component-update/background-networking/SmartScreen disabled')
 
 
 '''kill orphaned webview2 processes that belong to THIS app's WebView2 data folder.
@@ -256,23 +321,76 @@ We match by the data-folder path in the command line so we never touch other app
 WebView2 processes (e.g. VS Code).'''
 
 
+def _kill_procs_by_cmdline(name: str, substr: str, timeout: float = 6.0) -> int:
+    '''Kill processes whose name matches `name` AND whose command line contains `substr`.
+
+    Uses psutil instead of a global `taskkill /f /im msedgewebview2.exe`. Two reasons:
+      * a global taskkill hangs for the full 20s timeout when a pile of orphaned webview
+        processes has built up, and that 20s tax on every launch is what made the app
+        take minutes to open (it blew past the 30s UI-load timeout and forced retries);
+      * matching by command line lets us touch ONLY this app's WebView2 instances (they
+        all carry our WEBVIEW2_USER_DATA_FOLDER path), never other apps' webviews.'''
+    import psutil
+    killed = 0
+    targets = []
+    try:
+        for p in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                if p.info['name'] and p.info['name'].lower() == name.lower():
+                    cmd = ' '.join(p.info['cmdline'] or '')
+                    if substr and substr.lower() in cmd.lower():
+                        targets.append(p)
+            except Exception:
+                continue
+    except Exception as err:
+        diag.log('app', f'_kill_procs_by_cmdline scan failed: {err}', 'debug')
+        return 0
+    for p in targets:
+        try:
+            for child in p.children(recursive=True):
+                try:
+                    child.kill()
+                except Exception:
+                    pass
+            p.kill()
+            killed += 1
+        except Exception:
+            pass
+    return killed
+
+
+def _releasestaleprofilelock(user_data_folder: str) -> None:
+    '''Remove the Chromium profile lockfile left behind by a force-killed instance.
+    When no live msedgewebview2 process holds it the file is garbage; leaving it in
+    place can stall the next webview.start() for the whole UI-load timeout (measured:
+    60s of dead silence right after a force-kill, while the very next attempt loaded
+    in 2s). Only ever called when the process scan found nothing to kill.'''
+    if not user_data_folder:
+        return
+    for candidate in (Path(user_data_folder) / 'EBWebView' / 'lockfile',
+                      Path(user_data_folder) / 'lockfile'):
+        try:
+            if candidate.exists():
+                candidate.unlink()
+                diag.log('app', f'removed stale WebView2 profile lockfile: {candidate}', 'warning')
+        except Exception:
+            pass
+
+
 def _cleanupstalewebviewprocesses(user_data_folder: str) -> int:
     '''Kill orphaned msedgewebview2.exe processes left by a previously force-killed
     instance. They deadlock webview.start() on the next launch (window appears but the
-    app hangs). Because pywebview private_mode uses a temp profile, the processes cannot
-    be matched by path, so we kill them all. Other WebView2 apps (e.g. VS Code) recreate
-    their webviews automatically, so this is safe.'''
-    import subprocess
-    killed = 0
-    try:
-        out = subprocess.run(['taskkill', '/f', '/im', 'msedgewebview2.exe'],
-                             capture_output=True, text=True, timeout=20)
-        for line in (out.stdout or '').splitlines():
-            if line.startswith('SUCCESS'):
-                killed += 1
-    except Exception as err:
-        diag.log('app', f'_cleanupstalewebviewprocesses failed: {err}', 'debug')
-    return killed
+    app hangs). We match by our WebView2 data-folder path (set via
+    WEBVIEW2_USER_DATA_FOLDER) so we only kill THIS app's webviews — other WebView2
+    apps (e.g. VS Code) are never touched, and the kill never blocks for 20s.
+    When nothing was killed, also drop a stale profile lockfile (see
+    _releasestaleprofilelock).'''
+    n = _kill_procs_by_cmdline('msedgewebview2.exe', user_data_folder)
+    if n == 0:
+        n = _kill_procs_by_cmdline('msedgewebview2', user_data_folder)
+    if n == 0:
+        _releasestaleprofilelock(user_data_folder)
+    return n
 
 
 '''main'''
@@ -281,28 +399,114 @@ def _cleanupstalewebviewprocesses(user_data_folder: str) -> int:
 # WebView2 page has actually loaded; the supervisor watches it to detect a hung init.
 WV_LOADED_FLAG_ENV = 'VD_WV_LOADED_FLAG'
 MAX_UI_ATTEMPTS = 5
-# A healthy page measures 3-10s, but a *cold* first launch on a machine that just
-# force-killed a previous instance can take longer while the OS releases the
-# WebView2 lock. 15s was too aggressive and killed slow-but-alive inits, forcing
-# the user to wait through several silent retries before the window appeared.
+# A healthy page measures 2-10s warm, but a *cold* first launch (Defender scanning
+# the freshly built files + WebView2 shader compilation / profile conversion,
+# measured 16-60s in the field with a ~2.3GB GPU-memory spike) can legitimately
+# exceed 30s. Killing attempt 1 at 30s wasted exactly 30s + a full restart on
+# every cold start, hence the generous early budget below.
 UI_LOAD_TIMEOUT = 30
+# the first TWO attempts get the generous budget: on a cold machine the profile
+# conversion + Defender scan can span a restart (measured: attempt 1 failed at
+# 60s, attempt 2 was warm-enough to load in 2s but a 30s budget killed it first)
+UI_LOAD_TIMEOUT_EARLY = 60
+REGEN_ATTEMPTS_EARLY_TIMEOUT = 2
 
 
-def _wait_for_webview_loaded(flag_path: str, timeout: float) -> bool:
-    '''Poll for the child's "page loaded" flag file. Returns True once it appears.'''
-    deadline = time.monotonic() + timeout
+def _webview_procs_alive(user_data_folder: str, sample_secs: float = 3.0) -> bool:
+    '''True when at least one of THIS app's WebView2 processes exists AND is doing
+    real work (non-zero CPU over a short sample). A poisoned init either never
+    spawns the browser process or leaves it fully idle �� both are worth retrying
+    immediately instead of burning the whole load timeout. On any probe error we
+    assume "alive" and fall back to the full timeout (safe default).'''
+    try:
+        import psutil
+
+        def snapshot():
+            found = []
+            for p in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    if p.info['name'] and 'msedgewebview2' in p.info['name'].lower():
+                        cmd = ' '.join(p.info['cmdline'] or '')
+                        if user_data_folder.lower() in cmd.lower():
+                            found.append(p)
+                except Exception:
+                    continue
+            return found
+
+        procs = snapshot()
+        if not procs:
+            return False
+        cpu1 = {}
+        for p in procs:
+            try:
+                cpu1[p.pid] = sum(p.cpu_times())
+            except Exception:
+                pass
+        time.sleep(sample_secs)
+        for p in snapshot():
+            try:
+                if sum(p.cpu_times()) > cpu1.get(p.pid, 0.0) + 0.01:
+                    return True
+            except Exception:
+                continue
+        return False
+    except Exception:
+        return True
+
+
+def _wait_for_webview_loaded(flag_path: str, timeout: float, wv_folder: str = '') -> bool:
+    '''Poll for the child's "page loaded" flag file. Returns True once it appears.
+
+    Adds a liveness checkpoint ~20s in: if by then no WebView2 process of ours is
+    alive-and-busy, the init is hung �� return False early so the supervisor
+    retries right away instead of waiting out the full (possibly 60s) budget.
+    A healthy page loads in 2-10s warm and shows busy browser processes on a
+    cold start, so the probe never fires for a legitimate launch.'''
+    started = time.monotonic()
+    deadline = started + timeout
+    probe_at = started + min(20.0, max(10.0, timeout / 3.0))
+    dead_probes = 0
     while time.monotonic() < deadline:
         if os.path.exists(flag_path):
             return True
+        if wv_folder and dead_probes < 2 and time.monotonic() >= probe_at:
+            if not _webview_procs_alive(wv_folder):
+                dead_probes += 1
+                diag.log('app', f'supervisor: liveness probe {dead_probes}/2 found no busy WebView2 '
+                                f'process ({time.monotonic() - started:.0f}s in)')
+                probe_at = time.monotonic() + 10.0
+                if dead_probes >= 2:
+                    diag.log('app', 'supervisor: two consecutive dead liveness probes; '
+                                    'init is hung, retrying early', 'warning')
+                    return False
+            else:
+                # once proven alive, stop probing: the flag file decides the outcome
+                wv_folder = ''
+                diag.log('app', f'supervisor: WebView2 process alive at liveness checkpoint '
+                                f'({time.monotonic() - started:.0f}s in); continuing to wait')
         time.sleep(0.25)
     return False
 
 
 def _kill_process_tree(pid: int) -> None:
-    '''Kill a process and everything it spawned (its msedgewebview2.exe children).'''
+    '''Kill a process and everything it spawned (its msedgewebview2.exe children).
+
+    Uses psutil directly instead of `taskkill /f /T /pid` because that command can
+    hang for the full 20s timeout when the child's webview processes are stuck, which
+    left the hung child (and its orphans) alive and forced the whole 5-attempt retry
+    cycle on every launch.'''
     try:
-        subprocess.run(['taskkill', '/f', '/T', '/pid', str(pid)],
-                       capture_output=True, text=True, timeout=20)
+        import psutil
+        proc = psutil.Process(pid)
+        for child in proc.children(recursive=True):
+            try:
+                child.kill()
+            except Exception:
+                pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
     except Exception as err:
         diag.log('app', f'_kill_process_tree({pid}) failed: {err}', 'debug')
 
@@ -385,19 +589,54 @@ def run_ui(args) -> int:
         diag.log('app', f'window created: hidden={_start_hidden} events={type(window.events.loaded).__name__}')
 
     loaded_flag = threading.Event()
+    _window_shown = threading.Event()
     _flag_path = os.environ.get(WV_LOADED_FLAG_ENV, '')
 
     def _showwindowwhenready(attempt: int = 0):
-        if not _start_hidden:
+        if _window_shown.is_set():
             return
         try:
             window.show()
+            _window_shown.set()
             diag.log('app', 'window shown after successful load')
         except Exception as err:
             if attempt < 5:
                 threading.Timer(1.0, _showwindowwhenready, args=(attempt + 1,)).start()
             else:
                 diag.log('app', f'window.show() failed after retries: {err}', 'error')
+
+    def _showwindowearly(attempt: int = 0):
+        '''Feedback fallback: if the page has not finished loading 3s in, show the
+        (dark, still-loading) window anyway. On a cold start the WebView2 init can
+        take 15s+, and a fully invisible app makes the user double-click again —
+        which used to kill the startup-in-progress.
+
+        IMPORTANT: this MUST go through the native ShowWindow, NOT pywebview's
+        window.show(). The latter issues a synchronous Invoke onto the UI thread,
+        which deadlocks the WebView2 initialization (measured: every attempt whose
+        window.show() ran during init NEVER fired events.loaded and got killed by
+        the supervisor; every attempt without it loaded in 2-3s). A raw
+        ShowWindow(hwnd) does not touch pywebview's event pipeline at all.'''
+        if _window_shown.is_set() or loaded_flag.is_set():
+            return
+        try:
+            import ctypes
+            hwnd = ctypes.windll.user32.FindWindowW(None, f'{APP_NAME} v{APP_VERSION}')
+            if hwnd:
+                ctypes.windll.user32.ShowWindow(hwnd, 5)  # SW_SHOW
+                _window_shown.set()
+                diag.log('app', 'window shown early via native ShowWindow (page still loading) '
+                                'so the user gets immediate feedback')
+            elif attempt < 10:
+                # native form not created yet; retry shortly
+                threading.Timer(0.5, _showwindowearly, args=(attempt + 1,)).start()
+            else:
+                diag.log('app', 'early-show gave up: native window not found')
+        except Exception as err:
+            diag.log('app', f'early window.show() failed: {err}', 'debug')
+
+    if _start_hidden:
+        threading.Timer(3.0, _showwindowearly).start()
 
     def onloaded():
         try:
@@ -447,10 +686,13 @@ def run_ui(args) -> int:
     threading.Thread(target=watchdog, name='startup-watchdog', daemon=True).start()
 
     diag.log('app', 'entering webview event loop (ui thread blocks here)')
-    # private_mode keeps every launch on a clean temporary webview2 profile:
-    # a shared profile can be locked by a stale browser process of a killed
-    # previous instance, which deadlocks webview.start() (window shows but hangs).
-    webview.start(debug=bool(args.debug), private_mode=True, gui='edgechromium')
+    # Use a PERSISTENT profile in our dedicated WEBVIEW2_USER_DATA_FOLDER. A
+    # private (in-memory) profile threw away the GPU shader cache on every
+    # launch, which alone cost 10s+ on cold starts. Stale-profile lock deadlocks
+    # — the reason private mode was introduced — are already handled by
+    # _cleanupstalewebviewprocesses() in both supervisor and child. A persistent
+    # profile also keeps webview-side logins alive between launches.
+    webview.start(debug=bool(args.debug), private_mode=False, gui='edgechromium')
     diag.log('app', 'webview event loop exited, application is shutting down')
     return 0
 
@@ -487,8 +729,15 @@ def run_supervisor(args) -> int:
     flag_fd, flag_path = tempfile.mkstemp(prefix='vd_wv_loaded_', suffix='.flag')
     os.close(flag_fd)
 
-    # forward the original args to the child, stripping our internal --child marker
-    child_args = [sys.executable] + [a for a in sys.argv[1:] if a != '--child'] + ['--child']
+    # forward the original args to the child, stripping our internal --child marker.
+    # Frozen: the exe is self-bootstrapping, so [exe, ...args] is enough. In dev the
+    # interpreter needs the script path explicitly, otherwise `python --child` just
+    # errors out silently and the supervisor burns its 5 attempts on nothing.
+    if getattr(sys, 'frozen', False):
+        child_args = [sys.executable] + [a for a in sys.argv[1:] if a != '--child'] + ['--child']
+    else:
+        child_args = [sys.executable, str(Path(sys.argv[0]).resolve())] + \
+            [a for a in sys.argv[1:] if a != '--child'] + ['--child']
 
     for attempt in range(1, MAX_UI_ATTEMPTS + 1):
         try:
@@ -498,15 +747,17 @@ def run_supervisor(args) -> int:
         diag.log('app', f'supervisor: launching UI child (attempt {attempt}/{MAX_UI_ATTEMPTS})')
         env = dict(os.environ)
         env[WV_LOADED_FLAG_ENV] = flag_path
-        # every attempt starts hidden and only shows after a real page load, so
-        # a hung attempt never surfaces as a frozen window on the user's screen
+        # every attempt starts hidden and only shows after a real page load (or
+        # after 3s as feedback), so a hung attempt never surfaces as a frozen
+        # window before the user gets anything to look at
         env['VD_UI_START_HIDDEN'] = '1'
         try:
             proc = subprocess.Popen(child_args, env=env)
         except Exception as err:
             diag.log('app', f'supervisor: failed to launch UI child: {err}', 'error')
             return 1
-        loaded = _wait_for_webview_loaded(flag_path, UI_LOAD_TIMEOUT)
+        _timeout = UI_LOAD_TIMEOUT_EARLY if attempt <= REGEN_ATTEMPTS_EARLY_TIMEOUT else UI_LOAD_TIMEOUT
+        loaded = _wait_for_webview_loaded(flag_path, _timeout, _wv_folder)
         if loaded:
             diag.log('app', 'supervisor: UI loaded OK; attaching to child until it exits')
             try:
@@ -517,9 +768,15 @@ def run_supervisor(args) -> int:
                 os.remove(flag_path)
             except OSError:
                 pass
+            # final guarantee on "close == every process gone": reap any WebView2
+            # orphans the child may have left behind (no-op after a clean exit)
+            _n = _cleanupstalewebviewprocesses(_wv_folder)
+            if _n:
+                diag.log('app', f'supervisor: reaped {_n} leftover WebView2 process(es) after child exit', 'warning')
+            diag.log('app', 'shutdown complete: UI child exited, no app-owned processes remain')
             return 0
         # Hung: kill the child and its webview2 tree, then retry.
-        diag.log('app', f'supervisor: UI did not load within {UI_LOAD_TIMEOUT}s (attempt {attempt}/{MAX_UI_ATTEMPTS}); '
+        diag.log('app', f'supervisor: UI did not load within {_timeout}s (attempt {attempt}/{MAX_UI_ATTEMPTS}); '
                         f'terminating the hung child and retrying', 'warning')
         _kill_process_tree(proc.pid)
         try:

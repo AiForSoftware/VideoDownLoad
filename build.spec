@@ -87,6 +87,7 @@ hiddenimports = ['backend.api', 'backend.core', 'backend.progress']
 hiddenimports += collect_submodules('vd')
 hiddenimports += collect_submodules('webview')
 hiddenimports += collect_submodules('DrissionPage')
+hiddenimports += collect_submodules('yt_dlp')
 hiddenimports += ['curl_cffi', 'freeproxy', 'clr_loader', 'pythonnet',
                   # transitive runtime deps that PyInstaller's Analysis pass may
                   # miss when `collect_submodules('vd')` fails (e.g. because

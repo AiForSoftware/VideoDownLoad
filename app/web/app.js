@@ -20,7 +20,8 @@ const state = {
     logins: {},
     loginErrors: {},
     loginSupported: [],
-    logsCollapsed: false,
+    logsOpen: false,
+    logsUnread: 0,
     logFilter: 'all',
     parsing: false,
     tools: {},
@@ -38,6 +39,7 @@ const ICONS = {
     pause: '<svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M6 5h4v14H6zm8 0h4v14h-4z"/></svg>',
     cancel: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>',
     folder: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>',
+    audio: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M19 5a9 9 0 0 1 0 14"/></svg>',
 };
 
 /* ---------------- pywebview bridge ---------------- */
@@ -192,60 +194,96 @@ function renderProgress() {
     $('progressList').innerHTML = '';
 }
 
+// 把条目下的进度任务按"流"拆开：视频 / 音频 / 字幕 / 合并封装。
+// 之前是把所有流混成一条百分比，音频有没有在跑、有没有下完完全看不出来。
+const STREAM_GROUPS = [
+    { label: '视频', kinds: ['download', 'm3u8download'] },
+    { label: '音频', kinds: ['audio'] },
+    { label: '字幕', kinds: ['subtitle'] },
+    { label: '合并/封装', kinds: ['packaging'] },
+];
+
+// 一条流算"完成"的条件是跑到了 100%——引擎有时会把已完成任务移除（finished=true），
+// 有时只是停在 100% 不移除，两种都要识别成完成，否则音频下完了却显示不出来。
+function isStreamDone(p) {
+    const t = Number(p.total) || 0;
+    return t > 0 && (Number(p.completed) || 0) >= t;
+}
+
+function groupStreams(tasks) {
+    // 暂停/取消会把未跑完的任务标成 finished，这些残留任务不能再计入，
+    // 否则新一轮下载的字节数会和旧的一起叠加。
+    const usable = tasks.filter((p) => isStreamDone(p) || !p.finished);
+    const out = [];
+    for (const g of STREAM_GROUPS) {
+        const hit = usable.filter((p) => g.kinds.indexOf(p.kind) >= 0);
+        if (!hit.length) continue;
+        let totalBytes = 0, doneBytes = 0, speedSum = 0, hasTotal = false;
+        for (const p of hit) {
+            const t = Number(p.total) || 0, c = Number(p.completed) || 0;
+            if (t > 0) { totalBytes += t; hasTotal = true; }
+            doneBytes += c;
+            if (!isStreamDone(p)) speedSum += Number(p.speed) || 0;
+        }
+        out.push({
+            label: g.label, totalBytes, doneBytes, speedSum, hasTotal,
+            finished: hit.every(isStreamDone),
+            percent: hasTotal && totalBytes > 0 ? Math.min(100, doneBytes / totalBytes * 100) : null,
+        });
+    }
+    return out;
+}
+
+const fmteta = (s) => {
+    if (s == null) return '';
+    if (s < 1) return '即将完成';
+    if (s < 60) return `剩余 ${s.toFixed(0)} 秒`;
+    if (s < 3600) return `剩余 ${Math.floor(s / 60)} 分 ${Math.floor(s % 60)} 秒`;
+    return `剩余 ${Math.floor(s / 3600)} 时 ${Math.floor((s % 3600) / 60)} 分`;
+};
+
 function renderItemProgress(job, item) {
-    // 把该条目下的所有未完成进度任务（视频流/音频流/分片等）聚合为一条详情：
-    // 已下载 / 总体积 · 百分比 · 速度 · 剩余时间
-    const tasks = state.progress.filter((p) => p.job_id === job.id && p.item_key === item.key && !p.finished);
+    // 每个流单独一行：已下载/总体积 · 百分比 · 速度 · 剩余时间，完成后打勾
+    const tasks = state.progress.filter((p) => p.job_id === job.id && p.item_key === item.key);
     if (!tasks.length) return '';
-    let totalBytes = 0, doneBytes = 0, speedSum = 0, hasTotal = false;
-    for (const p of tasks) {
-        const t = Number(p.total) || 0;
-        const c = Number(p.completed) || 0;
-        if (t > 0) { totalBytes += t; hasTotal = true; }
-        doneBytes += c;
-        speedSum += Number(p.speed) || 0;
+    const groups = groupStreams(tasks);
+    if (!groups.length) return '';
+    let rowsHtml = '', percentSum = 0, percentCount = 0;
+    for (const g of groups) {
+        const eta = (g.speedSum > 0 && g.hasTotal && g.totalBytes > g.doneBytes)
+            ? (g.totalBytes - g.doneBytes) / g.speedSum : null;
+        let detail;
+        if (g.finished) {
+            detail = `✓ 完成 · ${fmtbytes(g.doneBytes)}`;
+        } else if (!g.hasTotal) {
+            // 封装阶段没有总量（ffmpeg 不回报进度），显示"处理中…"而不是 0 B
+            detail = '处理中…';
+        } else {
+            detail = `${fmtbytes(g.doneBytes)} / ${fmtbytes(g.totalBytes)} · ${g.percent.toFixed(1)}%`;
+            // Always surface the per-second speed, even when it is 0 (e.g. right
+            // after start, while paused, or when YouTube throttles the stream to
+            // a crawl) — an empty gap there read as "speed missing" to users.
+            detail += ` · ${g.speedSum ? fmtspeed(g.speedSum) : '0 B/s'}`;
+            if (eta) detail += ` · ${fmteta(eta)}`;
+        }
+        g.detail = detail;
+        const fill = g.finished
+            ? '<div class="progress-fill" data-fill style="width:100%"></div>'
+            : (g.percent == null ? '<div class="progress-fill unknown" data-fill></div>'
+                : `<div class="progress-fill" data-fill style="width:${g.percent.toFixed(2)}%"></div>`);
+        rowsHtml += `<div class="stream-row${g.finished ? ' done' : ''}">
+            <div class="stream-top"><span class="stream-name">${g.label}</span><span class="stream-detail" data-detail>${esc(detail)}</span></div>
+            <div class="progress-track">${fill}</div>
+        </div>`;
+        if (g.percent != null) { percentSum += g.percent; percentCount += 1; }
     }
-    const fmteta = (s) => {
-        if (s == null) return '';
-        if (s < 1) return '即将完成';
-        if (s < 60) return `剩余 ${s.toFixed(0)} 秒`;
-        if (s < 3600) return `剩余 ${Math.floor(s / 60)} 分 ${Math.floor(s % 60)} 秒`;
-        return `剩余 ${Math.floor(s / 3600)} 时 ${Math.floor((s % 3600) / 60)} 分`;
-    };
-    const totalTxt = hasTotal ? fmtbytes(totalBytes) : '';
-    const doneTxt = fmtbytes(doneBytes);
-    const percent = hasTotal ? Math.min(100, totalBytes > 0 ? doneBytes / totalBytes * 100 : 0) : null;
-    const eta = (speedSum > 0 && hasTotal && totalBytes > doneBytes) ? (totalBytes - doneBytes) / speedSum : null;
-    const etaTxt = (percent != null && percent < 100 && eta) ? fmteta(eta) : '';
-    const speedTxt = speedSum ? fmtspeed(speedSum) : '';
-    // 阶段标签：让"音频下载 / 合并 / 封装字幕"等无声阶段在进度条上可见，
-    // 避免用户以为视频下完就结束了（实际音频还没下完、或正在 ffmpeg 封装）。
-    const kinds = new Set(tasks.map((p) => p.kind));
-    let phase = '';
-    if (kinds.has('packaging')) phase = '合并/封装';
-    else if (kinds.has('audio')) phase = '音频下载';
-    else if (kinds.has('subtitle')) phase = '字幕下载';
-    let right;
-    if (percent == null) {
-        // 打包/封装阶段没有总量（ffmpeg 不回报进度），显示"处理中…"而非 0 B
-        right = phase ? `${phase} · 处理中…` : doneTxt;
-    } else {
-        right = `${doneTxt} / ${totalTxt} · ${percent.toFixed(1)}%${speedTxt ? ' · ' + speedTxt : ''}${etaTxt ? ' · ' + etaTxt : ''}`;
-        if (phase) right = `${phase} · ${right}`;
-    }
-    const fill = percent == null
-        ? '<div class="progress-fill unknown"></div>'
-        : `<div class="progress-fill" style="width:${percent.toFixed(2)}%"></div>`;
-    // 返回 {text, textHtml, bar, percent}：text 放在标题上方，bar（进度条）留在标题下方
+    // 分组构成变化（例如音频流刚创建、或某条流刚完成）时才重建 DOM，
+    // 否则只更新数字和宽度，避免每帧重排闪烁。
+    const sig = groups.map((g) => `${g.label}:${g.finished ? 1 : 0}:${g.hasTotal ? 1 : 0}`).join('|');
     return {
-        text: right,
-        textHtml: esc(right),
-        percent: percent,
-        bar: `<div class="item-progress-wrap">
-            <div class="item-progress">
-                <div class="progress-track">${fill}</div>
-            </div>
-        </div>`,
+        percent: percentCount ? percentSum / percentCount : null,
+        groups, sig,
+        bar: `<div class="item-progress-wrap" data-sig="${esc(sig)}">${rowsHtml}</div>`,
     };
 }
 
@@ -265,25 +303,31 @@ function updateJobProgress(jobs) {
             const itemEl = jobEl.querySelector(`.job-item[data-item-key="${CSS.escape(it.key)}"]`);
             if (!itemEl) continue;
             const shouldShow = it.status === 'downloading' || it.status === 'paused' || it.status === 'pausing';
-            let topEl = itemEl.querySelector('.item-progress-top');
             let wrapEl = itemEl.querySelector('.item-progress-wrap');
             if (!shouldShow) {
-                if (topEl) topEl.remove();
                 if (wrapEl) wrapEl.remove();
                 continue;
             }
             const prog = renderItemProgress(job, it);
             if (!prog) {
-                if (topEl) topEl.remove();
                 if (wrapEl) wrapEl.remove();
                 continue;
             }
-            if (topEl) topEl.textContent = prog.text;
-            else itemEl.insertAdjacentHTML('afterbegin', `<div class="item-progress-top">${prog.textHtml}</div>`);
-            if (wrapEl) {
-                const fill = wrapEl.querySelector('.progress-fill');
-                if (fill) fill.style.width = fill.classList.contains('unknown') ? '35%' : (prog.percent ? prog.percent.toFixed(2) + '%' : '0%');
+            if (wrapEl && wrapEl.getAttribute('data-sig') === prog.sig) {
+                // 流构成没变：原地更新数字与宽度，避免整块重排
+                const fills = wrapEl.querySelectorAll('[data-fill]');
+                const details = wrapEl.querySelectorAll('[data-detail]');
+                const rows = wrapEl.querySelectorAll('.stream-row');
+                prog.groups.forEach((g, idx) => {
+                    const fill = fills[idx];
+                    if (fill && !fill.classList.contains('unknown')) {
+                        fill.style.width = (g.percent == null ? 0 : g.percent).toFixed(2) + '%';
+                    }
+                    if (details[idx]) details[idx].textContent = g.detail || '';
+                    if (rows[idx]) rows[idx].classList.toggle('done', !!g.finished);
+                });
             } else {
+                if (wrapEl) wrapEl.remove();
                 itemEl.insertAdjacentHTML('beforeend', prog.bar);
             }
         }
@@ -326,9 +370,8 @@ function renderJobs() {
             const prog = (it.status === 'downloading' || it.status === 'paused' || it.status === 'pausing')
                 ? renderItemProgress(job, it)
                 : null;
-            // 下载详情小字放到条目最上方，进度条留在标题下方
+            // 进度条放在标题下方
             return `<div class="job-item" data-item-key="${esc(it.key)}">
-                ${prog ? `<div class="item-progress-top">${prog.textHtml}</div>` : ''}
                 <div class="job-item-main">
                     <span class="name" title="${esc(it.save_path || '')}">${esc(it.title)}</span>
                     ${statusHtml}
@@ -349,7 +392,12 @@ function renderJobs() {
         // While resuming the backend is reparsing on a background thread; hide the
         // play button so the user cannot trigger duplicate resume calls.
         const cancelTitle = ['done', 'error', 'cancelled'].includes(job.status) ? '移除' : '取消';
-        const actions = `${stateBtn}${folderBtn}<button class="icon-btn job-action danger" data-cancel="${esc(job.id)}" title="${esc(cancelTitle)}">${ICONS.cancel}</button>`;
+        // "补音频" appears for finished (done/error) jobs so a silent-video result
+        // can be repaired by re-downloading just the audio + re-merging.
+        const retryAudioBtn = (job.status === 'done' || job.status === 'error')
+            ? `<button class="icon-btn job-action primary" data-retryaudio="${esc(job.id)}" title="补音频并重新合并">${ICONS.audio}</button>`
+            : '';
+        const actions = `${stateBtn}${folderBtn}${retryAudioBtn}<button class="icon-btn job-action danger" data-cancel="${esc(job.id)}" title="${esc(cancelTitle)}">${ICONS.cancel}</button>`;
 
         const time = esc(job.finished_at || job.started_at || job.created_at);
         const remaining = Math.max(0, (job.total_count || 0) - (job.done_count || 0));
@@ -399,6 +447,21 @@ function renderLogs(newLogs) {
     }
     while (box.childElementCount > 800) box.removeChild(box.firstChild);
     if (nearBottom) box.scrollTop = box.scrollHeight;
+    // 面板收起时累计未读条数，显示在右下角浮标的角标上
+    if (!state.logsOpen) {
+        state.logsUnread += newLogs.length;
+        $('logsFabBadge').textContent = String(state.logsUnread);
+    }
+}
+
+function setLogsOpen(open) {
+    state.logsOpen = open;
+    $('logsCard').classList.toggle('open', open);
+    $('logsFab').style.display = open ? 'none' : 'inline-flex';
+    if (open) {
+        state.logsUnread = 0;
+        $('logsFabBadge').textContent = '';
+    }
 }
 
 function renderToolChips() {
@@ -730,19 +793,37 @@ function openLoginModal() {
 }
 
 function saveCookies() {
-    const map = {};
-    document.querySelectorAll('#sourceCookies textarea[data-source]').forEach((el) => {
-        const v = (el.value || '').trim();
-        if (v) map[el.getAttribute('data-source')] = v;
-    });
-    api('setconfig', { per_source_cookies: map }).then((res) => {
-        if (res && res.ok) {
+    // MERGE with the LIVE stored map (fetched fresh from the backend — a login
+    // that finished seconds ago may have updated it server-side). Empty
+    // textareas must never wipe previously saved cookies: auto-login capture
+    // writes here, and users clicking 保存 with untouched textareas were
+    // unknowingly clearing other platforms' logins. Clearing a platform's
+    // login is done via its 退出 button, not here.
+    api('login_status').then((st) => {
+        const map = Object.assign({}, (st && st.per_source_cookies) || {});
+        document.querySelectorAll('#sourceCookies textarea[data-source]').forEach((el) => {
+            const v = (el.value || '').trim();
+            if (v) map[el.getAttribute('data-source')] = v;
+        });
+        return api('setconfig', { per_source_cookies: map }).then((res) => {
+            if (!(res && res.ok)) { toast('保存失败：' + ((res && res.error) || '未知错误'), 'err'); return; }
             const cfg = state.config || (state.config = {});
             cfg.per_source_cookies = res.config.per_source_cookies;
+            // reflect the stored values back so the dialog shows what is really saved
+            document.querySelectorAll('#sourceCookies textarea[data-source]').forEach((el) => {
+                const src = el.getAttribute('data-source');
+                el.value = (cfg.per_source_cookies || {})[src] || '';
+            });
             toast('平台 Cookie 已保存', 'ok');
-        } else {
-            toast('保存失败：' + ((res && res.error) || '未知错误'), 'err');
-        }
+            // countdown reminder, then auto-close the login dialog
+            let left = 5;
+            toast('5 秒后自动关闭登录窗口', 'info');
+            const timer = setInterval(() => {
+                left -= 1;
+                if (left <= 0) { clearInterval(timer); closeLoginModal(); return; }
+                toast(`${left} 秒后自动关闭登录窗口`, 'info');
+            }, 1000);
+        });
     }).catch((err) => toast('保存失败：' + err, 'err'));
 }
 
@@ -808,11 +889,8 @@ function bindEvents() {
         api('pickfolder').then((res) => { if (res.ok && res.path) $('cfgWorkDir').value = res.path; });
     });
     $('openConfigDirBtn').addEventListener('click', () => api('openconfigdir').then((r) => { if (!r.ok) toast(r.error || '打开配置目录失败', 'err'); }));
-    $('toggleLogsBtn').addEventListener('click', () => {
-        state.logsCollapsed = !state.logsCollapsed;
-        $('logs').classList.toggle('collapsed', state.logsCollapsed);
-        $('toggleLogsBtn').textContent = state.logsCollapsed ? '展开' : '折叠';
-    });
+    $('logsFab').addEventListener('click', () => setLogsOpen(true));
+    $('toggleLogsBtn').addEventListener('click', () => setLogsOpen(false));
     $('clearLogsBtn').addEventListener('click', () => { $('logs').innerHTML = ''; });
     $('logFilterBtn').addEventListener('click', () => {
         state.logFilter = state.logFilter === 'all' ? 'warn' : 'all';
@@ -850,9 +928,9 @@ function bindEvents() {
     });
     // 任务卡片操作按钮使用事件委托，避免轮询重建 DOM 导致按钮闪烁/点击失效
     $('jobs').addEventListener('click', (e) => {
-        const btn = e.target.closest('button[data-pause], button[data-resume], button[data-cancel], button[data-open]');
+        const btn = e.target.closest('button[data-pause], button[data-resume], button[data-cancel], button[data-open], button[data-retryaudio]');
         if (!btn) return;
-        const jobId = btn.getAttribute('data-pause') || btn.getAttribute('data-resume') || btn.getAttribute('data-cancel') || btn.getAttribute('data-open');
+        const jobId = btn.getAttribute('data-pause') || btn.getAttribute('data-resume') || btn.getAttribute('data-cancel') || btn.getAttribute('data-open') || btn.getAttribute('data-retryaudio');
         const job = state.jobs.find((j) => j.id === jobId);
         if (!job) return;
         if (btn.hasAttribute('data-pause')) {
@@ -863,6 +941,15 @@ function bindEvents() {
             job.status = job.status === 'error' ? 'downloading' : 'resuming';
             renderJobs();
             api('resume', jobId);
+        } else if (btn.hasAttribute('data-retryaudio')) {
+            job.status = 'downloading';
+            const it = (job.items || []).find((x) => x.status === 'done' || x.status === 'error');
+            if (it) it.status = 'downloading';
+            renderJobs();
+            api('retryaudio', jobId).then((r) => {
+                if (!r || !r.ok) toast(r && r.error ? r.error : '补音频启动失败', 'err');
+                else if (r.already) toast('该视频已包含音频，无需补录', 'ok');
+            });
         } else if (btn.hasAttribute('data-cancel')) {
             job.status = 'cancelling';
             renderJobs();

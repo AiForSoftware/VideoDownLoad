@@ -95,12 +95,14 @@
             </div>
         </div>
 
-        <div class="card logs-card">
+        <!-- 运行日志默认收起：右下角浮标，点击后以浮层展开，不再占据主界面空间 -->
+        <button class="logs-fab" id="logsFab" title="运行日志">日志<span class="badge" id="logsFabBadge"></span></button>
+        <div class="card logs-card" id="logsCard">
             <div class="card-head">
                 <h2>运行日志</h2>
                 <div class="head-actions">
                     <button class="btn ghost sm" id="logFilterBtn" title="过滤掉 info/debug，只看警告和错误">精简</button>
-                    <button class="btn ghost sm" id="toggleLogsBtn">折叠</button>
+                    <button class="btn ghost sm" id="toggleLogsBtn" title="收起到右下角">收起</button>
                     <button class="btn ghost sm" id="clearLogsBtn">清空</button>
                 </div>
             </div>
@@ -149,9 +151,9 @@
                     <option value="auto">由解析结果决定（全选）</option>
                 </select>
             </label>
-            <label class="field checkbox-field">
+            <label class="field checkbox" title="同时把字幕轨压制进视频文件；支持 HLS 自动提取字幕，个别平台需要对应解析器支持，不支持时自动跳过">
                 <input id="cfgSubtitles" type="checkbox" />
-                <span>下载字幕并封装进视频（HLS 自动提取字幕轨，部分平台需解析器支持）</span>
+                <span>同时下载字幕并合并到视频</span>
             </label>
             <div class="field">
                 <span>平台白名单（勾选即启用；默认仅启用 抖音 + 哔哩哔哩）</span>

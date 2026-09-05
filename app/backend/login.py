@@ -34,6 +34,7 @@ if str(VD_SRC) not in sys.path and VD_SRC.exists():
 # Unknown sources fall back to "manual cookie" in the settings UI.
 LOGIN_URLS = {
     'BilibiliVideoClient': 'https://passport.bilibili.com/login',
+    'YouTubeVideoClient': 'https://www.youtube.com/',
     'DouyinVideoClient': 'https://www.douyin.com/',
     'KuaishouVideoClient': 'https://www.kuaishou.com/',
     'WeiboVideoClient': 'https://weibo.com/login.php',
@@ -73,6 +74,7 @@ def _chrome_profile_locked(user_data: str) -> bool:
 # the user closed the window without finishing, or a popup/iframe set cookies
 # on a different domain), so we verify before trusting the capture.
 LOGIN_REQUIRED_COOKIES = {
+    'YouTubeVideoClient': ('LOGIN_INFO', '__Secure-1PSID', 'SID'),
     'BilibiliVideoClient': ('SESSDATA', 'DedeUserID'),
     'DouyinVideoClient': ('sessionid', 'sid_tt', 'ttwid'),
     'KuaishouVideoClient': ('did', 'userId'),
