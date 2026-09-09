@@ -27,11 +27,16 @@ datas = [(os.path.join(APP_DIR, 'web'), 'web')]
 # platform/common parser modules are added separately as DATA files so the frozen exe
 # can still `importlib.import_module('vd.modules.sources.bilibili')` from the bundle
 # root without bloating PYZ (which otherwise breaks WebView2 init).
+'''永不打进产物的目录：Python 缓存 + 本地用户数据（mitm 抓包落盘 / 逆向样本）'''
+_EXCLUDE_DIRS = ('__pycache__', '_captured', '_samples')
+
 VD_PKG = os.path.join(ENGINE_SRC, 'vd')
 _packaged = 0
 if os.path.isdir(VD_PKG):
     for _root, _dirs, _files in os.walk(VD_PKG):
-        if '__pycache__' in _root:
+        # 剪枝：这些目录连进去都不进，杜绝用户隐私数据被写进 _internal
+        _dirs[:] = [d for d in _dirs if d not in _EXCLUDE_DIRS]
+        if os.path.basename(_root) in _EXCLUDE_DIRS:
             continue
         _rel = os.path.relpath(_root, ENGINE_SRC)
         for _file in _files:
@@ -63,6 +68,12 @@ datas += collect_data_files('webview')          # WebView2 / WinForms interop as
 datas += collect_data_files('tldextract')       # .tld_set_snapshot
 datas += collect_data_files('fake_useragent')   # data/browsers.jsonl
 
+'''顶栏「更新与反馈」按钮使用的公众号二维码图片（app/assets/ 下）'''
+_assets_dir = os.path.join(APP_DIR, 'assets')
+if os.path.isdir(_assets_dir):
+    datas.append((_assets_dir, 'assets'))
+    print(f'[spec] bundled assets dir: {_assets_dir}')
+
 '''node runtime: we only need node.exe, the bundled npm tree is huge and never used'''
 try:
     import nodejs_wheel
@@ -83,7 +94,7 @@ NOTE: we deliberately strip the eager `from .xxx import XxxVideoClient` lines
 out of `vd.modules.sources/__init__.py` and `vd.modules.common/__init__.py`
 to enable lazy parser loading. This means PyInstaller cannot discover the parser
 sub-modules via `collect_submodules`, so we have to list them by hand here.'''
-hiddenimports = ['backend.api', 'backend.core', 'backend.progress']
+hiddenimports = ['backend.api', 'backend.core', 'backend.progress', 'backend.tracker']
 hiddenimports += collect_submodules('vd')
 hiddenimports += collect_submodules('webview')
 hiddenimports += collect_submodules('DrissionPage')

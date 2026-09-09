@@ -1,64 +1,29 @@
-# ===== Python =====
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-.venv/
-venv/
-env/
-*.egg-info/
-.eggs/
-build/
-develop-eggs/
-downloads/
-eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg
+# 项目内部文档（AI 接手指南 / 解析器攻关档案），不纳入版本库
+docs/
 
-# ===== PyInstaller 构建产物 =====
-dist/
-build/
-release_v*/
-*.spec.bak
-
-# ===== 测试输出 =====
-_smoke_out/
-_selftest_output/
-vd_selftest_output/
-*.downloads/
-
-# ===== IDE / 编辑器 =====
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-.DS_Store
-Thumbs.db
-
-# ===== 日志 =====
+# ===== 本地用户数据 / 隐私 / 运行时产物（永不入库）=====
+# mitm 抓包落盘：含视频直链与请求响应内容，属用户隐私
+_captured/
+# 逆向样本素材
+_samples/
+# 下载输出目录（用户下载的视频 / 音频 / 字幕）
+vd_outputs/
+# 本地配置：含各平台登录 Cookie（per_source_cookies）
+config.json
+# 运行 / 诊断 / 构建日志（startup.log、desktop.log、build.log …）
 *.log
 
-# ===== Node (如果有) =====
-node_modules/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
+# ===== 构建产物 =====
+# PyInstaller 工作目录
+build/
+# PyInstaller 输出（onedir 产物与发布压缩包）
+dist/
 
-# ===== 临时文件 =====
-*.tmp
-*.bak
-*.orig
+# ===== Python 缓存 =====
+__pycache__/
+*.pyc
+*.pyo
 
-# ===== 调试残留（一次性诊断脚本/输出/PowerShell 误建文件）=====
-_t_*
-_test_*
-$null
-fix_*.py
-_fix_*.py
+# ===== 虚拟环境 =====
+.venv/
+venv/

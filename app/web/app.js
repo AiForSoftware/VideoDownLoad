@@ -26,6 +26,12 @@ const state = {
     parsing: false,
     tools: {},
     history: [],
+    // The parser list is only fetched on demand. Loading it pulls in the whole vd
+    // engine (every parser module), which costs a lot of RAM — doing that at
+    // startup made a freshly opened, completely idle app hold the entire engine in
+    // memory. It is now requested lazily: when the user opens Settings / 登录态
+    // (both render the parser list) or when the first parse needs it.
+    wantSources: false,
 };
 
 const STATUS_TEXT = {
@@ -186,12 +192,6 @@ function renderResults() {
 function updateDownloadBtn() {
     $('selectedCount').textContent = String(state.selected.size);
     $('downloadBtn').disabled = state.selected.size === 0 || state.parsing;
-}
-
-function renderProgress() {
-    // 下载详情不再做顶部聚合展示，而是显示在每个单独的下载条目上
-    // （见 renderItemProgress / renderJobs）。
-    $('progressList').innerHTML = '';
 }
 
 // 把条目下的进度任务按"流"拆开：视频 / 音频 / 字幕 / 合并封装。
@@ -571,19 +571,36 @@ function applyState(data) {
         state.logSeq = data.log_seq;
         renderLogs(data.logs);
     }
-    renderProgress();
     const snap = jobSnapshot(state.jobs);
     if (snap !== state._jobSnapshot) renderJobs();
     else updateJobProgress(state.jobs);
     renderEngineChip();
     // Force a refresh of the parser list whenever the engine transitions to
     // ready, so the settings whitelist shows every available parser instead of
-    // only the lazy-loaded subset. Also retry while the list is still empty
-    // (first poll races the import).
-    if (!prevEngineReady && state.engineReady) loadSources();
-    if (!(state.platforms.length + state.generic.length)) loadSources();
+    // only the lazy-loaded subset. Also retry while the list is still empty —
+    // but ONLY once the user actually asked for it (Settings / 登录态): an
+    // unconditional retry here fired `sources()` on the very first poll, which
+    // booted the whole vd engine at startup for an app that was doing nothing.
+    if (!prevEngineReady && state.engineReady && state.wantSources) loadSources();
+    if (state.wantSources && !(state.platforms.length + state.generic.length)) loadSources();
     const busy = state.jobs.some((j) => j.status === 'downloading' || j.status === 'queued');
     if (prevBusy && !busy && hadJobs) toast('下载任务已完成', 'ok');
+    schedulePoll(busy);
+}
+
+/* Adaptive polling: an idle app does not need a 700ms tick. Every poll builds a
+ * fresh JSON payload on the Python side and a fresh object graph here, so a fast
+ * idle tick means constant allocation (and GC) for a screen that never changes.
+ * Idle -> 1500ms, while anything is downloading/queued -> 700ms (snappy progress). */
+let pollTimer = null;
+let pollInterval = 1500;
+function schedulePoll(busy) {
+    if (busy === undefined) busy = state.jobs.some((j) => j.status === 'downloading' || j.status === 'queued');
+    const want = busy ? 700 : 1500;
+    if (pollTimer && want === pollInterval) return;
+    pollInterval = want;
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(poll, want);
 }
 
 let pollFailCount = 0;
@@ -605,7 +622,10 @@ function poll() {
 }
 
 function loadSources() {
-    api('sources').then((res) => {
+    // Mark the list as requested (this is what allows the polling loop to keep it
+    // fresh) and return the promise so callers can chain on the fresh list.
+    state.wantSources = true;
+    return api('sources').then((res) => {
         state.platforms = res.platforms || [];
         state.generic = res.generic || [];
         state.engineReady = !!res.engine_ready;
@@ -829,6 +849,10 @@ function saveCookies() {
 
 function closeLoginModal() { $('loginModal').hidden = true; }
 
+/* ---------------- 更新与反馈（顶栏按钮） ---------------- */
+function openFeedbackModal() { $('feedbackModal').hidden = false; }
+function closeFeedbackModal() { $('feedbackModal').hidden = true; }
+
 function saveSettings() {
     const checked = Array.from(document.querySelectorAll('#sourceGrid input:checked')).map((el) => el.value);
     const payload = {
@@ -880,7 +904,11 @@ function bindEvents() {
     $('themeBtn').addEventListener('click', cycleTheme);
     $('settingsBtn').addEventListener('click', openSettings);
     $('loginBtn').addEventListener('click', openLoginModal);
+    $('feedbackBtn').addEventListener('click', openFeedbackModal);
     $('closeLoginBtn').addEventListener('click', closeLoginModal);
+    $('closeFeedbackBtn').addEventListener('click', closeFeedbackModal);
+    $('closeFeedbackBtn2').addEventListener('click', closeFeedbackModal);
+    $('feedbackModal').addEventListener('click', (e) => { if (e.target === $('feedbackModal')) closeFeedbackModal(); });
     $('saveCookiesBtn').addEventListener('click', saveCookies);
     $('closeSettingsBtn').addEventListener('click', closeSettings);
     $('cancelSettingsBtn').addEventListener('click', closeSettings);
@@ -990,9 +1018,12 @@ function init() {
     const hash = decodeURIComponent((location.hash || '').replace(/^#/, ''));
     if (hash) $('urlInput').value = hash;
     poll();
-    setInterval(poll, 700);
-    setTimeout(loadSources, 800);
-    felog('polling started (700ms interval)', 'info', 'ui-boot');
+    schedulePoll();
+    // NOTE: no `loadSources()` here on purpose. `sources()` boots the vd engine,
+    // and doing it 800ms after launch meant every idle start paid the engine's
+    // full memory cost. The list is loaded when Settings / 登录态 is opened, or
+    // when the first url is parsed — whichever comes first.
+    felog('polling started (idle 1500ms / busy 700ms); parser list deferred', 'info', 'ui-boot');
 }
 
 window.__prefillUrl = function (url) { $('urlInput').value = url; };

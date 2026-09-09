@@ -9,7 +9,6 @@ Author:
 from __future__ import annotations
 
 import io
-import sys
 import time
 import threading
 from typing import Any, Callable, Dict, List, Optional
@@ -43,6 +42,13 @@ class NullFile():
 
     def fileno(self) -> int:
         raise io.UnsupportedOperation('fileno')
+
+
+# A single shared rich.Console bound to the null sink. Creating a Console per
+# Progress instance (or per NullProgress.console access) was allocating a fresh
+# Console object for every download — cheap individually, but it happened once
+# per parsed stream and never got released. One module-level instance is enough.
+_NULL_CONSOLE = Console(file=NullFile(), width=120, quiet=True, no_color=True)
 
 
 class DownloadCancelled(Exception):
@@ -172,6 +178,24 @@ class ProgressBus():
         if check is not None and check():
             raise DownloadPaused('the download job has been paused by the user')
 
+    def check_controls(self) -> None:
+        '''Check BOTH pause and cancel under a single lock take.
+
+        `update()` runs on the byte-level progress hot path and used to call
+        `checkpause()` then `checkinterrupt()` — each acquiring the RLock
+        separately. Doing it once avoids the redundant lock round-trip on every
+        progress tick (which can fire hundreds of times per second per stream).'''
+        job_id, _ = self._current_context()
+        if not job_id:
+            return
+        with self._lock:
+            pause_check = self._pauses.get(job_id)
+            interrupt_check = self._interrupts.get(job_id)
+        if pause_check is not None and pause_check():
+            raise DownloadPaused('the download job has been paused by the user')
+        if interrupt_check is not None and interrupt_check():
+            raise DownloadCancelled('the download job has been cancelled by the user')
+
     def onadd(self, owner: str, task_id: Any, description: str, total: Optional[float], fields: Dict[str, Any]) -> None:
         key = f'{owner}:{task_id}'
         ctx_job, ctx_item = self._current_context()
@@ -241,10 +265,6 @@ class ProgressBus():
                 item['finished'] = True
                 item['updated_at'] = time.time()
 
-    def reset(self) -> None:
-        with self._lock:
-            self._tasks.clear()
-
     def finish_tasks_for(self, job_id: str, item_key: Optional[str] = None) -> None:
         '''Mark all progress tasks belonging to (job_id, item_key) as finished.
         Called when an item is paused/cancelled/resumed so the next run does
@@ -258,8 +278,27 @@ class ProgressBus():
                 item['finished'] = True
                 item['updated_at'] = time.time()
 
+    # Finished tasks only matter for a beat (the UI shows a bar under the active
+    # item, then the card flips to a terminal state). Keep them for this window so
+    # a just-finished item can still report its final numbers, then reclaim them —
+    # otherwise a long session (many downloads) let `_tasks` grow without bound,
+    # dragging every 700-1500ms `snapshot()` into a full scan of all history.
+    _RECLAIM_AFTER_S = 300
+
     def snapshot(self) -> List[Dict[str, Any]]:
+        now = time.time()
         with self._lock:
+            expired = [
+                k for k, v in self._tasks.items()
+                if v.get('finished') and (now - v.get('updated_at', 0)) > self._RECLAIM_AFTER_S
+            ]
+            for k in expired:
+                self._tasks.pop(k, None)
+            # Drop owner contexts whose Progress instance no longer has any task.
+            if self._owner_ctx:
+                live_owners = {k.split(':', 1)[0] for k in self._tasks}
+                for owner in [o for o in self._owner_ctx if o not in live_owners]:
+                    self._owner_ctx.pop(owner, None)
             items = list(self._tasks.values())
         result: List[Dict[str, Any]] = []
         for item in items:
@@ -302,7 +341,7 @@ class DesktopProgress(RichProgress):
     _vd_desktop_hook = True
 
     def __init__(self, *columns, **kwargs):
-        kwargs.setdefault('console', Console(file=NullFile(), width=120, quiet=True, no_color=True))
+        kwargs.setdefault('console', _NULL_CONSOLE)
         super(DesktopProgress, self).__init__(*columns, **kwargs)
         self._owner = f'p{id(self):x}'
         # Bind this Progress instance to whatever job/item is running on the
@@ -329,9 +368,9 @@ class DesktopProgress(RichProgress):
 
     def update(self, task_id, **kwargs):
         result = super(DesktopProgress, self).update(task_id, **kwargs)
-        ProgressBus.instance().onupdate(self._owner, task_id, self._tasks.get(task_id))
-        ProgressBus.instance().checkpause()
-        ProgressBus.instance().checkinterrupt()
+        bus = ProgressBus.instance()
+        bus.onupdate(self._owner, task_id, self._tasks.get(task_id))
+        bus.check_controls()
         return result
 
     def remove_task(self, task_id):
@@ -351,15 +390,7 @@ class NullProgress:
     def remove_task(self, task_id): return None
     @property
     def console(self):
-        return Console(file=NullFile(), width=120, quiet=True, no_color=True)
-
-
-'''Marker printed at module import time so we can confirm (in the frozen
-bundle's startup log) which file PyInstaller actually bundled.'''
-
-
-sys.stderr.write(f'[vd_desktop.progress] loaded from {__file__}\n')
-sys.stderr.flush()
+        return _NULL_CONSOLE
 
 
 def install_progress_hook() -> None:
@@ -399,7 +430,7 @@ def _patch_global_progress_manager() -> None:
             self._started = False
             self._active_tasks = 0
             self._lock = threading.RLock()
-            self._console = Console(file=NullFile(), width=120, quiet=True, no_color=True)
+            self._console = _NULL_CONSOLE
             self._progress = NullProgress()
 
         def ensurestarted(self) -> None:

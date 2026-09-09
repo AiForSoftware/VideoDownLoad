@@ -411,6 +411,25 @@ body::before {
 
 .tools { display: flex; flex-wrap: wrap; gap: 8px; font-size: 11.5px; color: var(--muted); }
 
+/* ---------- 更新与反馈（顶栏按钮） ---------- */
+.text-btn {
+    display: inline-flex; align-items: center; gap: 6px;
+    height: 34px; padding: 0 14px; border-radius: 10px; cursor: pointer;
+    background: var(--card-2); border: 1px solid var(--line); color: var(--text);
+    font-size: 12.5px; font-family: inherit; transition: .18s; white-space: nowrap;
+}
+.text-btn:hover { border-color: var(--accent); color: var(--accent-soft); transform: translateY(-1px); }
+
+.feedback-body { align-items: center; text-align: center; gap: 16px; }
+.qr-wrap {
+    width: 220px; height: 220px; padding: 12px; border-radius: 14px;
+    background: #fff; display: grid; place-items: center;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, .35);
+}
+.qr-img { width: 100%; height: 100%; object-fit: contain; display: block; border-radius: 6px; }
+.qr-tip { font-size: 13px; line-height: 1.7; color: var(--muted); margin: 0; }
+.qr-tip b { color: var(--accent-soft); font-weight: 600; }
+
 /* ---------- toast ---------- */
 .toast {
     position: fixed; bottom: 26px; left: 50%; transform: translateX(-50%);

@@ -183,8 +183,18 @@ class DrissionPageUtils():
         is_linux, is_ci, is_root = DrissionPageUtils.islinux(), DrissionPageUtils.isci() or DrissionPageUtils.isgithubactions(), DrissionPageUtils.isroot()
         if headless and is_linux: DrissionPageUtils.safesetargument(co, "--headless=new")
         if is_linux and (is_ci or is_root): DrissionPageUtils.safesetargument(co, "--no-sandbox")
-        if DrissionPageUtils.needdisabledevshm(): DrissionPageUtils.safesetargument(co, "--disable-dev-shm-usage")
         if headless: DrissionPageUtils.safesetargument(co, "--disable-gpu")
+        # Keep the headless Chromium used for parsing/login lean: block background
+        # networking / extensions / translate / sync and extra helper processes so a
+        # single parse does not balloon RAM. --disable-dev-shm-usage is a no-op on
+        # Windows but vital on Linux containers.
+        DrissionPageUtils.safesetargument(co, "--disable-dev-shm-usage")
+        DrissionPageUtils.safesetargument(co, "--disable-background-networking")
+        DrissionPageUtils.safesetargument(co, "--disable-extensions")
+        DrissionPageUtils.safesetargument(co, "--disable-software-rasterizer")
+        DrissionPageUtils.safesetargument(co, "--disable-default-apps")
+        DrissionPageUtils.safesetargument(co, "--no-first-run")
+        DrissionPageUtils.safesetargument(co, "--disable-features=Translate,BackForwardCache,InfiniteSessionRestore,MediaRouter")
         DrissionPageUtils.safesetargument(co, "--window-size=1920,1080")
         return co
     '''pickportforpagelaunch'''

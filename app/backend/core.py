@@ -15,7 +15,6 @@ import re
 import sys
 import json
 import shutil
-import queue
 import logging
 import threading
 import traceback
@@ -53,12 +52,57 @@ os.environ.setdefault('VD_LAZY_PARSERS', '1')
 _SUBPROCESS_REGISTRY: list = []  # live Popen objects spawned by this process
 
 
+def _looks_like_real_video(save_path) -> bool:
+    """Validate that a downloaded file actually looks like a real video, not the
+    small error page that some CDNs (e.g. iesdouyin/aweme/v1/play under wind
+    control) return with HTTP 200 and a forged ``video/mp4`` Content-Type.
+    A real mp4/mov has an ``ftyp`` box at offset 4..7, and is never only a few
+    kilobytes. Returns False if the file is missing, too small, or has no
+    ``ftyp`` box — all strong signals the upstream returned an error body
+    instead of the actual media stream."""
+    if not save_path:
+        return False
+    try:
+        p = Path(save_path)
+        if not p.exists():
+            return False
+        # 16KB 远大于任何"200 + 错误页"体积(iesdouyin 风控页 < 8KB)，
+        # 但远小于任何真实短视频的 ftyp+moov 体积(> 50KB)。
+        if p.stat().st_size < 16384:
+            return False
+        with open(p, 'rb') as f:
+            head = f.read(32)
+        # mp4/mov/hevc/m4a 等 ISO BMFF box header: 4B size + 4B type，type 必为 'ftyp'。
+        return len(head) >= 12 and head[4:8] == b'ftyp'
+    except Exception:
+        return False
+
+
 def _kill_tracked_subprocesses() -> None:
-    '''Terminate every child process we have spawned (ffmpeg/aria2c/node/...).'''
+    '''Terminate every child process we have spawned (ffmpeg/aria2c/node/...),
+    RECURSIVELY killing its child tree.
+
+    DrissionPage launches Chromium as a multi-process tree (browser + zygote +
+    gpu + renderer). Killing only the top process left the renderer/gpu children
+    orphaned — they kept eating hundreds of MB of RAM and lingered in the
+    background after the window closed (the "5GB / leftover process" symptom).'''
+    import psutil
     for proc in list(_SUBPROCESS_REGISTRY):
         try:
             if proc.poll() is None:
-                proc.kill()
+                try:
+                    p = psutil.Process(proc.pid)
+                    for child in p.children(recursive=True):
+                        try:
+                            child.kill()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
         except Exception:
             pass
     _SUBPROCESS_REGISTRY.clear()
@@ -72,6 +116,10 @@ if os.name == 'nt':
     def _no_window_popen_init(self, *args, **kwargs):
         kwargs.setdefault('creationflags', _CREATE_NO_WINDOW)
         _orig_popen_init(self, *args, **kwargs)
+        # Keep only still-running children. Every Popen also holds an OS handle,
+        # so an append-only registry would grow without bound over a long session
+        # (and leak handles for long-finished ffmpeg/aria2c/node runs).
+        _SUBPROCESS_REGISTRY[:] = [p for p in _SUBPROCESS_REGISTRY if p.poll() is None]
         _SUBPROCESS_REGISTRY.append(self)
 
     _subprocess.Popen.__init__ = _no_window_popen_init
@@ -269,7 +317,7 @@ class UiLogHandler(logging.Handler):
         super(UiLogHandler, self).__init__(level=logging.DEBUG)
         self.sink = sink
 
-    def emit(self, record: LogRecord) -> None:
+    def emit(self, record: 'logging.LogRecord') -> None:
         try:
             self.sink(record.levelname.lower(), record.getMessage())
         except Exception:
@@ -714,10 +762,6 @@ class VideoDlService():
         overrides['download_subtitles'] = bool(self.config.download_subtitles)
         return target.download([video_info], num_threadings=1, request_overrides=overrides) or []
 
-    def prewarm(self) -> None:
-        '''Lazily start the engine load in the background (no startup cost).'''
-        self.ensureengine(wait=False)
-
     '''-------------------- parse --------------------'''
 
     def parse(self, url: str) -> Dict[str, Any]:
@@ -1078,6 +1122,21 @@ class VideoDlService():
                     return
                 self.log('error', f"[{job['id']}] download error: {err}")
                 self.log('debug', traceback.format_exc())
+            # downloaded 列表只表示"下载器认为成功"(HTTP 200)，不能信。
+            # iesdouyin/aweme/v1/play 等接口在风控/缺签名时会返回 200 + 几 KB
+            # 错误内容(Content-Type 伪装 video/mp4)，下载器无法识别。落盘前
+            # 做最小体积 + mp4 magic bytes 校验，把"假成功"挡在外面。
+            if downloaded:
+                _valid = [d for d in downloaded if _looks_like_real_video(getattr(d, 'save_path', None))]
+                if _valid:
+                    downloaded = _valid
+                else:
+                    self.log('error', f"[{job['id']}] download returned but file is missing/invalid (wind-control?): {item['title']}")
+                    item['status'] = 'error'
+                    item['error'] = '下载完成但文件无效，请尝试登录抖音后重试，或检查视频是否已删除'
+                    self._update_job_status(job)
+                    self.bus.finish_tasks_for(job_id, item_key)
+                    downloaded = []
             if downloaded:
                 item['status'] = 'done'
                 first = downloaded[0]
@@ -1418,21 +1477,6 @@ class VideoDlService():
             video_info = self._parsed.get(item['key'])
         if video_info is None:
             return {'ok': False, 'error': '解析缓存已失效，请回到主页重新解析链接后再补音频'}
-        source = str(getattr(video_info, 'source', '') or '')
-        client = self._get_or_build_job_client(job_id, source)
-        if client is None:
-            return {'ok': False, 'error': self._import_error or '引擎不可用，无法补音频'}
-        # Nothing to do if the video already carries an audio track.
-        if self._video_has_audio(video_path):
-            with self._jobs_lock:
-                live = self._jobs.get(job_id)
-                if live is not None:
-                    it = next((x for x in live['items'] if x['key'] == item['key']), None)
-                    if it is not None:
-                        it['status'] = 'done'; it['error'] = ''
-                    self._update_job_status(live)
-                    self._save_jobs()
-            return {'ok': True, 'already': True, 'message': '该视频已包含音频，无需补录'}
         with self._jobs_lock:
             if job.get('status') not in ('done', 'error'):
                 return {'ok': False, 'error': '该任务正在运行，无法补音频'}
@@ -1441,11 +1485,38 @@ class VideoDlService():
                 if it['key'] == item['key'] and it['status'] in ('done', 'error'):
                     it['status'] = 'downloading'; it['error'] = ''
             self._save_jobs()
-        threading.Thread(target=self._retry_audio_worker, args=(job_id, item['key'], video_path, video_info, client),
+        # Building the per-job client can trigger a multi-second engine import,
+        # and _video_has_audio() runs a synchronous ffprobe. Both USED to run here
+        # on the bridge thread — clicking 补音频 froze the window until they
+        # finished. They now happen inside the worker (which also does the merge).
+        threading.Thread(target=self._retry_audio_worker, args=(job_id, item['key'], video_path, video_info),
                          name=f'retryaudio-{job_id}', daemon=True).start()
         return {'ok': True, 'async': True}
 
-    def _retry_audio_worker(self, job_id: str, item_key: str, video_path: str, video_info, client) -> None:
+    def _retry_audio_worker(self, job_id: str, item_key: str, video_path: str, video_info) -> None:
+        source = str(getattr(video_info, 'source', '') or '')
+        client = self._get_or_build_job_client(job_id, source)
+        if client is None:
+            with self._jobs_lock:
+                job = self._jobs.get(job_id)
+                if job is not None:
+                    item = next((it for it in job['items'] if it['key'] == item_key), None)
+                    if item is not None:
+                        item['status'] = 'error'; item['error'] = self._import_error or '引擎不可用，无法补音频'
+                    self._update_job_status(job)
+                    self._save_jobs()
+            return
+        # Nothing to do if the video already carries an audio track.
+        if self._video_has_audio(video_path):
+            with self._jobs_lock:
+                live = self._jobs.get(job_id)
+                if live is not None:
+                    it = next((x for x in live['items'] if x['key'] == item_key), None)
+                    if it is not None:
+                        it['status'] = 'done'; it['error'] = ''
+                    self._update_job_status(live)
+                    self._save_jobs()
+            return
         try:
             ok, msg = self._download_audio_and_merge(job_id, item_key, video_path, video_info, client)
         except Exception as err:
@@ -1795,16 +1866,20 @@ class VideoDlService():
 
     '''-------------------- state --------------------'''
 
-    def _streams_done_for(self, job_id: str, item_key: str) -> int:
+    def _streams_done_for(self, job_id: str, item_key: str, snapshot: List[Dict[str, Any]]) -> int:
         '''How many of an in-flight item's streams (video/audio/segments) have
         fully downloaded, according to the live progress bus.
 
         The persisted ``done_count`` only advances when a whole ITEM finishes
         (video + audio + merge), which made the header sit at "0/2" for the
         entire download. Counting completed stream tasks gives the counter
-        partial credit: video done -> "1/2", audio done too -> "2/2".'''
+        partial credit: video done -> "1/2", audio done too -> "2/2".
+
+        `snapshot` is the progress bus snapshot, built ONCE by the caller (a
+        long session rebuilds it on every download tick, and calling
+        bus.snapshot() per item would rescan all history N times per poll).'''
         done = 0
-        for t in self.bus.snapshot():
+        for t in snapshot:
             if t.get('job_id') != job_id or t.get('item_key') != item_key:
                 continue
             if t.get('kind') not in ('download', 'audio', 'm3u8download'):
@@ -1817,7 +1892,9 @@ class VideoDlService():
                 continue
         return done
 
-    def jobsnapshot(self) -> List[Dict[str, Any]]:
+    def jobsnapshot(self, progress_snapshot: List[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        if progress_snapshot is None:
+            progress_snapshot = self.bus.snapshot()
         # Self-healing sweep: if a job was left in a transient state (cancelling /
         # pausing) but every item has reached a terminal status and no worker will
         # ever re-derive its status (e.g. the retry-audio thread died between the
@@ -1866,7 +1943,7 @@ class VideoDlService():
                 partial = 0
                 for it in job['items']:
                     if it['status'] in ('queued', 'downloading', 'pausing', 'paused'):
-                        partial += min(it.get('subtask_count', 1), self._streams_done_for(job['id'], it['key']))
+                        partial += min(it.get('subtask_count', 1), self._streams_done_for(job['id'], it['key'], progress_snapshot))
                 done_count = max(done_count, partial)
             result.append({
                 'id': job['id'], 'status': job['status'], 'error': job['error'], 'work_dir': job['work_dir'],
@@ -1884,8 +1961,9 @@ class VideoDlService():
         if self._poll_count % 100 == 0:
             diag.log('core', f'state heartbeat: polled {self._poll_count} times, active_jobs={len(self._jobs)}, parsed_items={len(self._parsed)}')
         started = time.perf_counter()
+        progress_snapshot = self.bus.snapshot()
         result = {
-            'jobs': self.jobsnapshot(), 'progress': self.bus.snapshot(),
+            'jobs': self.jobsnapshot(progress_snapshot), 'progress': progress_snapshot,
             'logs': self.logs(after_seq), 'log_seq': self.log_seq,
             'engine_ready': self.engineready, 'engine_error': self.engineerror,
             'engine_state': self._engine_state, 'engine_version': self.engine_version,

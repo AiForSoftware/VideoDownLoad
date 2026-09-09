@@ -28,6 +28,7 @@
         <button class="icon-btn" id="settingsBtn" title="设置">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2V21a2 2 0 0 1-4 0v-.1A1.7 1.7 0 0 0 7 19.4a1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.7 1.7 0 0 0 2 15a1.7 1.7 0 0 0-1.2-1H1a2 2 0 0 1 0-4h.1A1.7 1.7 0 0 0 2.6 9a1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.7 1.7 0 0 0 9 4.6h.1A1.7 1.7 0 0 0 10 3.4V3a2 2 0 0 1 4 0v.1a1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0 1.2 2.9H21a2 2 0 0 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
         </button>
+        <button class="text-btn" id="feedbackBtn">更新与反馈</button>
     </div>
 </header>
 
@@ -189,6 +190,25 @@
         <div class="modal-foot">
             <div class="spacer"></div>
             <button class="btn primary" id="saveCookiesBtn">保存 Cookie</button>
+        </div>
+    </div>
+</div>
+
+<div class="modal-mask" id="feedbackModal" hidden>
+    <div class="modal">
+        <div class="modal-head">
+            <h2>更新与反馈</h2>
+            <button class="icon-btn" id="closeFeedbackBtn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+            </button>
+        </div>
+        <div class="modal-body feedback-body">
+            <div class="qr-wrap"><img class="qr-img" src="../assets/qrcode_for_gh_95d87017d959_344.jpg" alt="公众号二维码" /></div>
+            <p class="qr-tip">扫描上方二维码关注公众号，<b>获取最新软件与版本更新</b>；<br/>如有使用建议或问题，欢迎在公众号留言反馈。</p>
+        </div>
+        <div class="modal-foot">
+            <div class="spacer"></div>
+            <button class="btn ghost" id="closeFeedbackBtn2">关闭</button>
         </div>
     </div>
 </div>

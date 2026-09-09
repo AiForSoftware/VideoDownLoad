@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+import json
 import argparse
 import subprocess
 import tempfile
@@ -318,12 +319,78 @@ def setupwebviewdatafolder() -> None:
     # Measured pain points on cold start: component-update fetches, background
     # networking and SmartScreen checks each add seconds (or hang on a flaky
     # network) BEFORE the first navigation even begins.
+    #
+    # NOTE: keep the GPU enabled. --disable-gpu / --disable-gpu-program-cache /
+    # --disable-shader-disk-cache / --disable-software-rasterizer were tried and
+    # measured: the GPU process is still spawned (it just falls back to software
+    # compositing) so nothing is saved, while the persistent-profile shader cache
+    # — the thing that makes warm starts fast — is thrown away. Net: no memory
+    # win, slower cold starts. Do not add them back (see docs/AGENT_BUILD_GUIDE 4.1#6).
+    # Same for --js-flags=--max-old-space-size (renderer unchanged at 32 or 64MB)
+    # and --disable-breakpad (crashpad handler is still spawned).
     os.environ['WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS'] = (
         '--disable-component-update --disable-background-networking '
         '--disable-domain-reliability --disable-sync --no-first-run --noerrdialogs '
-        '--disable-features=ElasticOverscroll,msSmartScreenProtection'
+        '--renderer-process-limit=1 --process-per-site '
+        '--disable-backgrounding-occluded-windows --disk-cache-size=33554432 '
+        '--disable-features=ElasticOverscroll,msSmartScreenProtection,'
+        'CalculateNativeWinOcclusion,BackForwardCache,AcceptCHFrame,MediaRouter,Translate'
     )
-    diag.log('app', 'webview2 startup args: component-update/background-networking/SmartScreen disabled')
+    # Escape hatch for tuning the memory budget without a rebuild: set
+    # VD_WEBVIEW_EXTRA_ARGS before launching and the switches are appended to the
+    # set above (e.g. VD_WEBVIEW_EXTRA_ARGS=--in-process-gpu).
+    _extra_args = os.environ.get('VD_WEBVIEW_EXTRA_ARGS', '').strip()
+    if _extra_args:
+        os.environ['WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS'] += ' ' + _extra_args
+    diag.log('app', 'webview2 startup args: component-update/background-networking/SmartScreen disabled (GPU kept for shader cache)')
+
+
+'''working-set trim: hand the pages an idle process will never touch again back to the OS'''
+
+
+def trimworkingset(pid: int = None, min_mb: int = 0, max_mb: int = 0) -> bool:
+    '''Give the pages an idle process will not touch again back to the OS.
+
+    A frozen Python process pays for every module it touched while importing: the
+    code and data pages stay resident long after the import is over. Same story for
+    the supervisor, which then does nothing but wait on a child for hours.
+
+    Two modes:
+      * `min_mb=max_mb=0` -> EmptyWorkingSet: discard every discardable page. Only
+        appropriate for a process that is about to sit idle (the supervisor).
+      * `max_mb>0`        -> SetProcessWorkingSetSize: cap the working set instead of
+        wiping it. The UI child keeps a healthy `max_mb` of resident pages so the
+        window stays snappy, while everything above that is paged out.
+
+    Nothing is lost either way — clean pages are simply faulted back in on demand.'''
+    if os.name != 'nt':
+        return False
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        PROCESS_SET_QUOTA = 0x0100
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = kernel32.OpenProcess(PROCESS_SET_QUOTA | PROCESS_QUERY_LIMITED_INFORMATION,
+                                      False, int(pid or os.getpid()))
+        if not handle:
+            return False
+        try:
+            if max_mb > 0:
+                kernel32.SetProcessWorkingSetSize(handle,
+                                                  ctypes.c_size_t(min_mb * 1024 * 1024),
+                                                  ctypes.c_size_t(max_mb * 1024 * 1024))
+                return True
+            try:
+                ok = bool(ctypes.windll.psapi.EmptyWorkingSet(handle))
+            except Exception:
+                ok = False
+            if not ok:
+                kernel32.SetProcessWorkingSetSize(handle, ctypes.c_size_t(-1), ctypes.c_size_t(-1))
+            return True
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return False
 
 
 '''kill orphaned webview2 processes that belong to THIS app's WebView2 data folder.
@@ -524,6 +591,36 @@ def _kill_process_tree(pid: int) -> None:
         diag.log('app', f'_kill_process_tree({pid}) failed: {err}', 'debug')
 
 
+def _kill_drissionpage_browsers() -> int:
+    '''Kill orphaned DrissionPage (Chromium) browser processes — the multi-process
+    tree spawned by a parse/login or left behind by a force-kill. They match by the
+    `--remote-debugging-port=` flag in their command line, which ONLY DrissionPage
+    sets; a normal user Chrome/Edge never carries it, so we never touch the user's
+    own browser. Killing the whole tree (not just the parent) is what actually
+    frees the renderer/gpu RAM and stops the "leftover process after close" symptom.'''
+    killed = 0
+    try:
+        for p in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                name = (p.info.get('name') or '').lower()
+                if name not in ('msedge.exe', 'chrome.exe', 'chromium.exe', 'msedge', 'chrome', 'chromium'):
+                    continue
+                cmd = ' '.join(p.info.get('cmdline') or [])
+                if '--remote-debugging-port=' in cmd:
+                    for child in p.children(recursive=True):
+                        try:
+                            child.kill()
+                        except Exception:
+                            pass
+                    p.kill()
+                    killed += 1
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return killed
+
+
 def _hard_exit() -> None:
     '''Forcefully terminate THIS process and its entire child tree. Used as the
     final guarantee on window close so nothing is left running in the background.
@@ -543,6 +640,8 @@ def _hard_exit() -> None:
                 pass
     except Exception as err:
         diag.log('app', f'_hard_exit: child kill failed: {err}', 'debug')
+    # belt-and-suspenders: any DrissionPage browser not under our process tree
+    _kill_drissionpage_browsers()
     os._exit(0)
 
 
@@ -665,6 +764,17 @@ def run_ui(args) -> int:
                     pass
             if args.url:
                 window.evaluate_js(f'window.__prefillUrl && window.__prefillUrl({args.url!r})')
+            # The page is up and every startup import is done: give the pages we
+            # only touched during import back to the OS. Measured on a warm start
+            # this returns tens of MB that an idle window would otherwise hold.
+            def _trimself():
+                before = diag.rssmb()
+                # Cap (not empty) the working set: this process owns the window, and
+                # wiping its pages outright makes the first interaction after launch
+                # pay a burst of hard faults. 96MB comfortably covers the live UI.
+                if trimworkingset(min_mb=32, max_mb=96):
+                    diag.log('app', f'capped own working set: rss {before}MB -> {diag.rssmb()}MB')
+            threading.Timer(2.0, _trimself).start()
         except Exception as err:
             diag.log('app', f'onloaded handler failed: {err}', 'error')
             diag.log('app', traceback.format_exc(), 'debug')
@@ -696,6 +806,31 @@ def run_ui(args) -> int:
         diag.log('app', f'watchdog: page did NOT load within {UI_LOAD_TIMEOUT}s; WebView2 environment is stuck. '
                         f'A supervisor should restart this process automatically.', 'warning')
 
+    def memdiagnostics():
+        '''Sample rss / python object count / thread list while the page comes up.
+
+        Forensics for a nasty failure mode: pywebview builds the `window.pywebview.api`
+        proxy by recursively walking the js_api object, and with a non-private
+        `self.service` that walk covered the whole VideoDlService + Window graph —
+        the process rss climbed to 1.7-4.8GB and the page took 30-60s to load.
+        Sampling told us the growth was python objects in `generate_js_object`.
+        Opt-in (VD_MEM_DIAG=1) because gc.get_objects() is not free.'''
+        import gc
+        for _ in range(24):  # at most ~2 minutes
+            if loaded_flag.is_set():
+                break
+            try:
+                objs = len(gc.get_objects())
+                names = [t.name for t in threading.enumerate()]
+                diag.log('app', f'mem: rss={diag.rssmb()}MB pyobjects={objs} '
+                                f'threads={len(names)} {names[:8]}')
+            except Exception:
+                pass
+            time.sleep(5)
+
+    if os.environ.get('VD_MEM_DIAG'):
+        threading.Thread(target=memdiagnostics, name='mem-diag', daemon=True).start()
+
     threading.Thread(target=watchdog, name='startup-watchdog', daemon=True).start()
 
     diag.log('app', 'entering webview event loop (ui thread blocks here)')
@@ -707,6 +842,78 @@ def run_ui(args) -> int:
     # profile also keeps webview-side logins alive between launches.
     webview.start(debug=bool(args.debug), private_mode=False, gui='edgechromium')
     diag.log('app', 'webview event loop exited, application is shutting down')
+    return 0
+
+
+'''SoftwareTracker 安装/激活上报（POST /api/report，见 SoftwareTracker/sdk/README_zh.md）
+
+桌面壳没有安装程序钩子，因此把「首次启动」视为安装完成：
+  * 本机从未上报过      -> install
+  * 上报过但版本号变了  -> upgrade
+  * 版本未变            -> 不产生新事件，仅补发历史失败队列
+每次启动最多一条事件，避免后台「安装明细」被重复刷（后台 install/first_run/upgrade
+目前各记一条，做不到按事件类型筛选，见 README 5.1）。上报全程在 daemon 线程里做，
+失败也写本地队列由下次启动补发，绝不拖慢启动、绝不影响主流程。'''
+
+
+def _tracker_state_path() -> Path:
+    try:
+        from platformdirs import user_data_dir
+        directory = Path(user_data_dir(appname='vd-desktop', appauthor='vd'))
+    except Exception:
+        directory = Path.home() / '.vd-desktop'
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return directory / 'tracker-state.json'
+
+
+def _read_tracker_state() -> Dict[str, Any]:
+    try:
+        return json.loads(_tracker_state_path().read_text(encoding='utf-8') or '{}')
+    except Exception:
+        return {}
+
+
+def _write_tracker_state(state: Dict[str, Any]) -> None:
+    try:
+        _tracker_state_path().write_text(json.dumps(state, ensure_ascii=False), encoding='utf-8')
+    except Exception:
+        pass
+
+
+def report_startup_async() -> None:
+    '''异步上报一次启动事件（install / upgrade），由 supervisor 在取得单实例锁后调用'''
+    def _run():
+        try:
+            from backend.tracker import create_tracker
+            tracker = create_tracker(version=APP_VERSION)
+            state = _read_tracker_state()
+            last_version = state.get('version')
+            if last_version == APP_VERSION:
+                tracker.flush_queue()  # 版本未变：只补发上次失败的积压
+                return
+            event_type = 'upgrade' if last_version else 'install'
+            tracker.track({'eventType': event_type, 'status': 'success', 'version': APP_VERSION})
+            _write_tracker_state({'version': APP_VERSION, 'lastEvent': event_type,
+                                  'lastReport': time.strftime('%Y-%m-%d %H:%M:%S')})
+            diag.log('app', f'tracker: reported {event_type} v{APP_VERSION} device={tracker.device_id}')
+        except Exception as err:
+            diag.log('app', f'tracker report skipped: {err}', 'debug')
+
+    threading.Thread(target=_run, name='tracker-report', daemon=True).start()
+
+
+def report_uninstall() -> int:
+    '''同步上报卸载事件（供卸载程序调用：--report-uninstall），确保退出前发出'''
+    try:
+        from backend.tracker import create_tracker
+        ok = create_tracker(version=APP_VERSION).track_async(
+            {'eventType': 'uninstall', 'status': 'success', 'version': APP_VERSION})
+        diag.log('app', f'tracker: uninstall reported ok={ok}')
+    except Exception as err:
+        diag.log('app', f'tracker uninstall report failed: {err}', 'debug')
     return 0
 
 
@@ -722,6 +929,8 @@ def run_supervisor(args) -> int:
 
     if not acquiresingleinstance():
         return 0
+    # 走到这里说明是真正的启动（不是被挡掉的第二个实例）：异步上报一次 install / upgrade
+    report_startup_async()
 
     # Kill orphaned WebView2 processes from any previously force-killed instance
     # BEFORE launching the first child, so attempt 1 starts in a clean environment
@@ -773,8 +982,20 @@ def run_supervisor(args) -> int:
         loaded = _wait_for_webview_loaded(flag_path, _timeout, _wv_folder)
         if loaded:
             diag.log('app', 'supervisor: UI loaded OK; attaching to child until it exits')
+            # From here on the supervisor is a pure watchdog: it owns no window and
+            # only waits on the child. Trim our own working set once, then again
+            # every minute — an idle app should not keep the import-time pages
+            # resident for hours.
+            if trimworkingset():
+                diag.log('app', f'supervisor: trimmed own working set (rss now {diag.rssmb()}MB)')
             try:
-                proc.wait()
+                while True:
+                    try:
+                        proc.wait(timeout=60)
+                        break
+                    except subprocess.TimeoutExpired:
+                        trimworkingset()
+                        continue
             except Exception:
                 pass
             try:
@@ -786,6 +1007,9 @@ def run_supervisor(args) -> int:
             _n = _cleanupstalewebviewprocesses(_wv_folder)
             if _n:
                 diag.log('app', f'supervisor: reaped {_n} leftover WebView2 process(es) after child exit', 'warning')
+            _dn = _kill_drissionpage_browsers()
+            if _dn:
+                diag.log('app', f'supervisor: reaped {_dn} leftover DrissionPage browser process(es) after child exit', 'warning')
             diag.log('app', 'shutdown complete: UI child exited, no app-owned processes remain')
             return 0
         # Hung: kill the child and its webview2 tree, then retry.
@@ -816,9 +1040,14 @@ def main() -> int:
                         help='run a headless parse+download self test and write a json report to the user home dir')
     parser.add_argument('--child', action='store_true', dest='child',
                         help=argparse.SUPPRESS)  # internal: run the UI as a supervised child
+    parser.add_argument('--report-uninstall', action='store_true', dest='report_uninstall',
+                        help=argparse.SUPPRESS)  # 卸载程序调用：同步上报一次 uninstall
     args = parser.parse_args()
 
     diag.log('app', f'===== launch: {APP_NAME} v{APP_VERSION} args={sys.argv[1:]} frozen={bool(getattr(sys, "frozen", False))} python={sys.version.split()[0]} exe={getattr(sys, "executable", "?")} =====')
+
+    if args.report_uninstall:
+        return report_uninstall()
 
     if args.selftest:
         diag.log('app', f'selftest requested: {args.selftest}')

@@ -23,6 +23,8 @@ _LOCK = threading.Lock()
 _T0 = time.perf_counter()
 _LOG_PATH: Optional[Path] = None
 _MAX_BYTES = 2 * 1024 * 1024
+_LINES_SINCE_ROTATE = 0
+_RSS_CACHE = (0.0, 0.0)
 
 
 '''logpath'''
@@ -45,6 +47,15 @@ def logpath() -> Path:
 
 
 def _rotateifneeded() -> None:
+    # Called from every log line, so it must not touch the disk each time: a
+    # stat() pair per line is the same class of mistake as the old per-line
+    # fsync (2-4s of launch tax). Size only matters at the 2MB threshold, so
+    # checking every 100 lines is more than enough.
+    global _LINES_SINCE_ROTATE
+    _LINES_SINCE_ROTATE += 1
+    if _LINES_SINCE_ROTATE < 100:
+        return
+    _LINES_SINCE_ROTATE = 0
     try:
         path = logpath()
         if path.exists() and path.stat().st_size > _MAX_BYTES:
@@ -61,12 +72,25 @@ def _rotateifneeded() -> None:
 '''rssmb'''
 
 
-def rssmb() -> float:
+def rssmb(fresh: bool = False) -> float:
+    '''Current process rss in MB.
+
+    Cached for 1s by default: every log line used to build a fresh psutil.Process
+    and issue a system call just to print a number nobody reads except when
+    debugging a memory problem. Pass `fresh=True` when the value is the point of
+    the call (e.g. right after a working-set trim).'''
+    global _RSS_CACHE
+    now = time.monotonic()
+    cached_at, value = _RSS_CACHE
+    if not fresh and (now - cached_at) < 1.0:
+        return value
     try:
         import psutil
-        return round(psutil.Process().memory_info().rss / 1048576, 1)
+        value = round(psutil.Process().memory_info().rss / 1048576, 1)
     except Exception:
-        return -1.0
+        value = -1.0
+    _RSS_CACHE = (now, value)
+    return value
 
 
 '''log'''

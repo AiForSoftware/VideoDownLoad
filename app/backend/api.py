@@ -6,10 +6,8 @@ Author:
 '''
 from __future__ import annotations
 
-import os
-import webbrowser
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+import threading
+from typing import Any, Dict, List
 
 from . import diag
 from .core import VideoDlService, defaultworkdir, HistoryStore, Config
@@ -25,36 +23,45 @@ except Exception:  # pragma: no cover
 
 class JsApi():
     def __init__(self, service: VideoDlService = None, version: str = '1.0.0'):
-        self.service = service or VideoDlService(version=version)
-        self.version = version
-        self.window = None
+        # IMPORTANT: every attribute here is deliberately underscore-prefixed.
+        # pywebview builds the `window.pywebview.api` proxy by RECURSIVELY walking
+        # the js_api object (webview/util.py::inject_pywebview -> get_functions),
+        # and `name.startswith('_')` is the only thing that stops it. With plain
+        # `self.service` / `self._window` it walked the whole object graph —
+        # VideoDlService (config, thread pool, progress bus, builder classes) and
+        # the pywebview Window itself — allocating hundreds of thousands of python
+        # objects: the proxy took 30-60s to build and rss grew to 1.7-4.8GB on a
+        # cold start. Private names keep the walk down to ~30 plain methods.
+        self._service = service or VideoDlService(version=version)
+        self._version = version
+        self._window = None
 
     '''bind the pywebview window (used by the folder dialog)'''
     def bindwindow(self, window) -> None:
-        self.window = window
+        self._window = window
 
     '''-------------------- bootstrap --------------------'''
 
     def bootstrap(self) -> Dict[str, Any]:
         return {
-            'version': self.version,
+            'version': self._version,
             'config': {
-                'work_dir': self.service.config.work_dir,
-                'num_threadings': self.service.config.num_threadings,
-                'concurrent_downloads': self.service.config.concurrent_downloads,
-                'proxy': self.service.config.proxy,
-                'cookies': self.service.config.cookies,
-                'per_source_cookies': self.service.config.per_source_cookies,
-                'default_quality': self.service.config.default_quality,
-                'apply_common_clients_only': self.service.config.apply_common_clients_only,
-                'download_subtitles': self.service.config.download_subtitles,
-                'allowed_sources': self.service.config.allowed_sources,
-                'last_url': self.service.config.last_url,
+                'work_dir': self._service.config.work_dir,
+                'num_threadings': self._service.config.num_threadings,
+                'concurrent_downloads': self._service.config.concurrent_downloads,
+                'proxy': self._service.config.proxy,
+                'cookies': self._service.config.cookies,
+                'per_source_cookies': self._service.config.per_source_cookies,
+                'default_quality': self._service.config.default_quality,
+                'apply_common_clients_only': self._service.config.apply_common_clients_only,
+                'download_subtitles': self._service.config.download_subtitles,
+                'allowed_sources': self._service.config.allowed_sources,
+                'last_url': self._service.config.last_url,
             },
             'default_work_dir': defaultworkdir(),
-            'engine_ready': self.service.engineready,
-            'engine_state': self.service.engine_state,
-            'engine_version': self.service.engine_version,
+            'engine_ready': self._service.engineready,
+            'engine_state': self._service.engine_state,
+            'engine_version': self._service.engine_version,
         }
 
     def sources(self) -> Dict[str, Any]:
@@ -65,7 +72,7 @@ class JsApi():
         # parsers. Use the parser-name tables (populated by `ensureengine`) as
         # the authoritative list so the user can configure ANY of the ~60+
         # available parsers, not just the few that have been touched.
-        if not self.service.engineready:
+        if not self._service.engineready:
             # Kick off a BACKGROUND load only. We must NOT use wait=True here:
             # `sources()` is called from the frontend polling loop, and a
             # synchronous load would block this API call (and the pywebview UI
@@ -74,15 +81,15 @@ class JsApi():
             # the engine-ready transition (prevEngineReady) and re-fetches the
             # full ~60+ parser list at that point, so we don't need to block here.
             try:
-                self.service.ensureengine(wait=False)
+                self._service.ensureengine(wait=False)
             except Exception:
                 pass
 
         platforms: List[str] = []
         generic: List[str] = []
-        if self.service.engineready:
-            platform_table = getattr(self.service, '_platform_parser_table', []) or []
-            common_table = getattr(self.service, '_common_parser_table', []) or []
+        if self._service.engineready:
+            platform_table = getattr(self._service, '_platform_parser_table', []) or []
+            common_table = getattr(self._service, '_common_parser_table', []) or []
             # Filter out abstract / internal base classes that shouldn't be
             # exposed to the user (e.g. BaseVideoClient itself).
             _internal = {'BaseVideoClient', 'CommonVideoClient', 'BaseModuleBuilder'}
@@ -90,13 +97,13 @@ class JsApi():
             generic = [cls for _, cls in common_table if cls not in _internal]
         else:
             # engine still loading: fall back to whatever has registered so far
-            platforms = list(self.service.source_names or [])
-            generic = list(self.service.common_source_names or [])
+            platforms = list(self._service.source_names or [])
+            generic = list(self._service.common_source_names or [])
 
         # defensive fallback: if the tables are empty but the engine claims
         # to be ready, also pull from the live REGISTERED_MODULES so the UI
         # chip can show the real count.
-        if self.service.engineready and (not platforms or not generic):
+        if self._service.engineready and (not platforms or not generic):
             try:
                 from vd.modules import VideoClientBuilder, CommonVideoClientBuilder  # noqa: WPS433
                 if not platforms:
@@ -107,9 +114,9 @@ class JsApi():
                 pass
 
         return {
-            'engine_ready': self.service.engineready,
-            'engine_state': self.service.engine_state,
-            'engine_error': self.service.engineerror,
+            'engine_ready': self._service.engineready,
+            'engine_state': self._service.engine_state,
+            'engine_error': self._service.engineerror,
             'platforms': platforms,
             'generic': generic,
         }
@@ -118,7 +125,7 @@ class JsApi():
 
     def setconfig(self, config: Dict[str, Any] = None) -> Dict[str, Any]:
         config = config or {}
-        cfg = self.service.config
+        cfg = self._service.config
         if 'work_dir' in config and str(config['work_dir']).strip():
             cfg.work_dir = str(config['work_dir']).strip()
         if 'num_threadings' in config:
@@ -147,20 +154,25 @@ class JsApi():
             value = config['allowed_sources']
             cfg.allowed_sources = list(value) if isinstance(value, (list, tuple)) else []
         cfg.save()
-        # the client has to be rebuilt when the configuration changes
-        try:
-            self.service._buildclient(force=True)
-        except Exception:
-            pass
-        self.service.log('info', 'settings saved')
+        # Rebuilding the client is expensive (several seconds on a cold engine): it
+        # MUST NOT run on the bridge thread that called setconfig, or the 保存
+        # button freezes for that long. Rebuild on a background thread instead.
+        threading.Thread(target=self._rebuild_client, name='rebuild-client', daemon=True).start()
+        self._service.log('info', 'settings saved')
         return {'ok': True, 'config': self.bootstrap()['config']}
 
+    def _rebuild_client(self) -> None:
+        try:
+            self._service._buildclient(force=True)
+        except Exception as err:
+            diag.log('api', f'client rebuild failed: {err}', 'warning')
+
     def pickfolder(self) -> Dict[str, Any]:
-        if self.window is None:
+        if self._window is None:
             return {'ok': False, 'error': 'the window is not ready yet'}
         try:
             folder_flag = getattr(getattr(webview, 'FileDialog', None), 'FOLDER', getattr(webview, 'FOLDER_DIALOG', None))
-            result = self.window.create_file_dialog(folder_flag, directory=self.service.config.work_dir or defaultworkdir())
+            result = self._window.create_file_dialog(folder_flag, directory=self._service.config.work_dir or defaultworkdir())
         except Exception as err:
             return {'ok': False, 'error': str(err)}
         if not result:
@@ -171,43 +183,21 @@ class JsApi():
     '''-------------------- parse / download --------------------'''
 
     def parse(self, url: str) -> Dict[str, Any]:
-        # Run the (network-bound) parse on a background thread so the pywebview
-        # bridge thread is never blocked by a slow/stalled parser. The result is
-        # pushed back to the frontend via window.applyParseResult(); the bridge
-        # call returns immediately with an async token. This is what keeps the
-        # window responsive ("解析" never freezes the UI, even on a bad network).
-        import threading, json, uuid
-        if getattr(self, '_parse_jobs', None) is None:
-            self._parse_jobs = {}
-        token = uuid.uuid4().hex
-        self._parse_jobs[token] = None
-
-        def _run():
-            try:
-                result = self.service.parse(url)
-            except Exception:
-                import traceback as _tb
-                diag.log('core', f'parse thread crashed: {_tb.format_exc()}', 'error')
-                result = {'ok': False, 'error': '解析线程异常', 'items': []}
-            self._parse_jobs[token] = result
-            try:
-                if self.window is not None:
-                    payload = json.dumps({'token': token, 'result': result}, ensure_ascii=False)
-                    self.window.evaluate_js(f'(window.applyParseResult||function(){{}})({payload})')
-            except Exception as err:
-                diag.log('core', f'failed to push parse result to frontend: {err}', 'warning')
-
-        threading.Thread(target=_run, name=f'parse-{token[:8]}', daemon=True).start()
-        return {'ok': True, 'async': True, 'token': token}
+        return self._run_async_parse('parse', url)
 
     def parsebatch(self, urls: List[str] = None) -> Dict[str, Any]:
-        # Batch variant of `parse()`: parse several urls and merge the results.
-        # Mirrors the async token + push-to-frontend pattern so the UI never
-        # blocks on a slow/stalled parser in the batch.
-        import threading, json, uuid
         urls = [str(u).strip() for u in (urls or []) if str(u).strip()]
         if not urls:
             return {'ok': False, 'error': '没有提供链接', 'items': []}
+        return self._run_async_parse('parse_batch', urls)
+
+    def _run_async_parse(self, method: str, arg) -> Dict[str, Any]:
+        # One shared implementation for parse()/parsebatch(): run the network-bound
+        # parse on a background thread so the pywebview bridge thread is never
+        # blocked by a slow/stalled parser. The result is pushed to the frontend via
+        # window.applyParseResult(); this call returns immediately with an async
+        # token. That is what keeps "解析" responsive even on a bad network.
+        import json, uuid
         if getattr(self, '_parse_jobs', None) is None:
             self._parse_jobs = {}
         token = uuid.uuid4().hex
@@ -215,46 +205,49 @@ class JsApi():
 
         def _run():
             try:
-                result = self.service.parse_batch(urls)
+                result = self._service.parse(arg) if method == 'parse' else self._service.parse_batch(arg)
             except Exception:
                 import traceback as _tb
-                diag.log('core', f'batch parse thread crashed: {_tb.format_exc()}', 'error')
-                result = {'ok': False, 'error': '批量解析线程异常', 'items': [], 'batch': True, 'url_count': len(urls)}
+                diag.log('core', f'{method} thread crashed: {_tb.format_exc()}', 'error')
+                result = {'ok': False, 'error': f'{method} 线程异常', 'items': []}
+                if method == 'parse_batch':
+                    result['batch'] = True
+                    result['url_count'] = len(arg) if isinstance(arg, list) else 0
             self._parse_jobs[token] = result
             try:
-                if self.window is not None:
+                if self._window is not None:
                     payload = json.dumps({'token': token, 'result': result}, ensure_ascii=False)
-                    self.window.evaluate_js(f'(window.applyParseResult||function(){{}})({payload})')
+                    self._window.evaluate_js(f'(window.applyParseResult||function(){{}})({payload})')
             except Exception as err:
-                diag.log('core', f'failed to push batch parse result to frontend: {err}', 'warning')
+                diag.log('core', f'failed to push parse result to frontend: {err}', 'warning')
 
-        threading.Thread(target=_run, name=f'parsebatch-{token[:8]}', daemon=True).start()
+        threading.Thread(target=_run, name=f'{method}-{token[:8]}', daemon=True).start()
         return {'ok': True, 'async': True, 'token': token}
 
     def download(self, keys: List[str] = None, work_dir: str = None) -> Dict[str, Any]:
-        return self.service.enqueue(list(keys or []), work_dir)
+        return self._service.enqueue(list(keys or []), work_dir)
 
     def pause(self, job_id: str) -> Dict[str, Any]:
-        return self.service.pause(job_id)
+        return self._service.pause(job_id)
 
     def resume(self, job_id: str) -> Dict[str, Any]:
-        return self.service.resume(job_id)
+        return self._service.resume(job_id)
 
     def cancel(self, job_id: str) -> Dict[str, Any]:
-        return self.service.cancel(job_id)
+        return self._service.cancel(job_id)
 
     def retryaudio(self, job_id: str) -> Dict[str, Any]:
-        return self.service.retry_audio(job_id)
+        return self._service.retry_audio(job_id)
 
     def clearjobs(self) -> Dict[str, Any]:
-        return self.service.clearjobs()
+        return self._service.clearjobs()
 
     def shutdown(self) -> Dict[str, Any]:
         '''Cancel all downloads and kill child processes. Invoked when the UI
         window is closed so the app does not leave orphaned ffmpeg/aria2c/node
         or WebView2 processes running in the background.'''
         try:
-            self.service.shutdown()
+            self._service.shutdown()
         except Exception as err:
             diag.log('api', f'shutdown failed: {err}', 'warning')
         return {'ok': True}
@@ -264,7 +257,7 @@ class JsApi():
             after_seq = int(after_seq or 0)
         except Exception:
             after_seq = 0
-        return self.service.state(after_seq)
+        return self._service.state(after_seq)
 
     '''frontend log sink: javascript anchors are forwarded into startup.log'''
 
@@ -282,7 +275,7 @@ class JsApi():
         from .login import login_manager
         if not source:
             return {'ok': False, 'error': '缺少平台参数'}
-        return login_manager.start(source, self.service)
+        return login_manager.start(source, self._service)
 
     def login_finish(self, source: str = '') -> Dict[str, Any]:
         '''Tell the running login window the user has finished signing in.'''
@@ -296,7 +289,7 @@ class JsApi():
         from .login import login_manager, LOGIN_URLS
         return {
             'logins': login_manager.status(),
-            'per_source_cookies': dict(self.service.config.per_source_cookies or {}),
+            'per_source_cookies': dict(self._service.config.per_source_cookies or {}),
             'supported': list(LOGIN_URLS.keys()),
         }
 
@@ -305,7 +298,7 @@ class JsApi():
         from .login import login_manager
         if not source:
             return {'ok': False, 'error': '缺少平台参数'}
-        return login_manager.logout(source, self.service)
+        return login_manager.logout(source, self._service)
 
     '''-------------------- system helpers --------------------'''
 
@@ -324,15 +317,15 @@ class JsApi():
         return VideoDlService.openpath(str(Config.configpath().parent))
 
     def history(self) -> Dict[str, Any]:
-        return {'history': list(self.service.history)}
+        return {'history': list(self._service.history)}
 
     def clearhistory(self) -> Dict[str, Any]:
-        self.service.history = HistoryStore.clear()
-        return {'ok': True, 'history': self.service.history}
+        self._service.history = HistoryStore.clear()
+        return {'ok': True, 'history': self._service.history}
 
     def removehistory(self, url: str) -> Dict[str, Any]:
-        self.service.history = HistoryStore.remove(url or '')
-        return {'ok': True, 'history': self.service.history}
+        self._service.history = HistoryStore.remove(url or '')
+        return {'ok': True, 'history': self._service.history}
 
     def checktools(self) -> Dict[str, Any]:
         import shutil
