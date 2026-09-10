@@ -77,7 +77,20 @@ def naivecleanhtml(text):
 def cookies2dict(cookies: str | dict = None):
     if not cookies: cookies = {}
     if isinstance(cookies, dict): return cookies
-    if isinstance(cookies, str): (c := SimpleCookie()).load(cookies); return {k: morsel.value for k, morsel in c.items()}
+    if isinstance(cookies, str):
+        (c := SimpleCookie())
+        try: c.load(cookies)
+        except Exception: pass
+        result = {k: morsel.value for k, morsel in c.items()}
+        # 兜底：SimpleCookie 对部分厂商 cookie（如腾讯含特殊字段的登录态）会整体解析失败
+        # 返回空字典，导致登录态被静默丢弃。用稳健的 ';' 切分兜底，保住登录态。
+        if not result and cookies.strip():
+            for part in cookies.split(';'):
+                part = part.strip()
+                if not part or '=' not in part: continue
+                k, v = part.split('=', 1)
+                result[k.strip()] = v.strip()
+        return result
     raise TypeError(f'cookies type is "{type(cookies)}", expect cookies to "str" or "dict" or "None".')
 
 

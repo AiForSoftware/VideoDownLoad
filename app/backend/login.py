@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -80,7 +81,12 @@ LOGIN_REQUIRED_COOKIES = {
     'KuaishouVideoClient': ('did', 'userId'),
     'WeiboVideoClient': ('SUB', 'SUBP'),
     'XiaohongshuVideoClient': ('a1', 'web_session'),
-    'TencentVideoClient': ('vqq_vusession', 'vqq_access_token'),
+    # 腾讯视频登录态 Cookie 名（2026-09 实测）：登录后 v.qq.com 下发带 _video_qq_
+    # 前缀的会话 Cookie（_video_qq_vusession / vuserid / openid / access_token …）。
+    # 任一命中即算登录成功（ponytail: 只保留实测字段，不堆兼容猜测）。
+    'TencentVideoClient': ('_video_qq_vusession', '_video_qq_vuserid',
+                           '_video_qq_openid', '_video_qq_access_token',
+                           '_video_qq_refresh_token', '_video_qq_main_login'),
     'IqiyiVideoClient': ('P00002', 'QC005'),
     'YoukuVideoClient': ('_savec5', 'cna'),
     'BaiduTiebaVideoClient': ('BDUSS',),
@@ -158,14 +164,35 @@ class LoginManager():
                         pass
                     return
                 task['state'] = 'extracting'
+                # 腾讯登录态 Cookie（vqq_vusession 等）由前端 JS 在登录跳回 v.qq.com
+                # 后异步换取，用户点"完成提取"瞬间可能尚未落库。等页面加载完成 + 短
+                # 暂留，避免误判"登录未完成"（ponytail: 天花板=依赖前端换票时序，已用
+                # 等待兜底；若平台改到服务端 set 则无需等待，但等待对所有平台无害）。
+                try:
+                    page.wait.load_complete(timeout=8)
+                except Exception:
+                    pass
+                time.sleep(1.5)
                 cookies = DrissionPageUtils.getcookiesdict(page) or {}
+                # 腾讯登录态常落在 .qq.com 父域（p_skey / p_luin / p_uin …），
+                # page 级 cookie 只返回当前 v.qq.com 域、会漏读父域，导致已登录却
+                # 误判"登录未完成"。补合并浏览器全量 cookie（含所有域）兜底。
+                try:
+                    browser_cookies = page.browser.cookies().as_dict()
+                    if browser_cookies:
+                        merged = dict(browser_cookies)
+                        merged.update(cookies)
+                        cookies = merged
+                except Exception:
+                    pass
                 cookie_str = _cookie_dict_to_string(cookies)
                 if not _has_login_cookie(source, cookies):
                     task['state'] = 'incomplete'
                     task['error'] = (
                         f'登录未完成：未能捕获到「{source}」的关键登录 Cookie。'
                         '请确认已在弹出的浏览器中真正登录账号（右上角头像/昵称可见），'
-                        '再点"完成提取"。本次未覆盖已有的 Cookie。'
+                        '再点"完成提取"。本次未覆盖已有的 Cookie。\n'
+                        f'【调试】本次实际捕获到的 Cookie 名：{sorted(cookies.keys())}'
                     )
                     try:
                         page.quit()
