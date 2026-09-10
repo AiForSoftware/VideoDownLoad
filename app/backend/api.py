@@ -57,6 +57,7 @@ class JsApi():
                 'download_subtitles': self._service.config.download_subtitles,
                 'allowed_sources': self._service.config.allowed_sources,
                 'last_url': self._service.config.last_url,
+                'language': self._service.config.language,
             },
             'default_work_dir': defaultworkdir(),
             'engine_ready': self._service.engineready,
@@ -153,6 +154,9 @@ class JsApi():
         if 'allowed_sources' in config:
             value = config['allowed_sources']
             cfg.allowed_sources = list(value) if isinstance(value, (list, tuple)) else []
+        if 'language' in config:
+            value = str(config['language'] or '').strip()
+            cfg.language = value if value in {'zh-CN', 'en-US'} else ''
         cfg.save()
         # Rebuilding the client is expensive (several seconds on a cold engine): it
         # MUST NOT run on the bridge thread that called setconfig, or the 保存

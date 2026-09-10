@@ -147,10 +147,10 @@ def defaultworkdir() -> str:
 # parse is fast (no 60+ parser modules imported up front). Users opt into more
 # platforms from the Settings panel — each is lazy-loaded on first use.
 # WebMediaGrabber always stays available as the universal fallback.
-# Only the three VERIFIED platform parsers ship enabled by default
-# (douyin / bilibili / youtube — see docs/视频解析器构建流程.md). All other
-# upstream platform parsers have been removed from the engine entirely.
-DEFAULT_ALLOWED_SOURCES = ['DouyinVideoClient', 'BilibiliVideoClient', 'YouTubeVideoClient']
+# Only the VERIFIED platform parsers ship enabled by default
+# (douyin / bilibili / youtube / 腾讯视频 — see docs/视频解析器构建流程.md). All
+# other upstream platform parsers have been removed from the engine entirely.
+DEFAULT_ALLOWED_SOURCES = ['DouyinVideoClient', 'BilibiliVideoClient', 'YouTubeVideoClient', 'TencentVideoClient']
 
 
 @dataclass
@@ -175,6 +175,8 @@ class Config():
     # even these two are only imported when their URL is actually parsed.
     allowed_sources: List[str] = field(default_factory=lambda: list(DEFAULT_ALLOWED_SOURCES))
     last_url: str = ''
+    # UI language: 'zh-CN' | 'en-US'. Empty = 用户还没选过，首次打开时弹一次语言选择。
+    language: str = ''
 
     '''config path'''
 

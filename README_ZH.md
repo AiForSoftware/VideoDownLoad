@@ -1,8 +1,8 @@
 # 全能下载器 · VideoDownLoad
 
 Windows 桌面视频下载器：把命令行视频下载引擎 `vd` 封装成带 GUI 的桌面应用
-（pywebview + Edge WebView2），支持**抖音 / B站 / YouTube** 的解析、选档、并发下载、
-任务级暂停恢复，以及**字幕自动下载并封装进视频**。
+（pywebview + Edge WebView2），支持**抖音 / B站 / YouTube / 腾讯视频** 的解析、选档、并发下载、
+任务级暂停恢复，以及**字幕自动下载并封装进视频**。界面支持**中英文切换**（默认中文，首次打开会提示选择语言）。
 
 ---
 
@@ -21,7 +21,7 @@ Windows 桌面视频下载器：把命令行视频下载引擎 `vd` 封装成带
 
 | 特性 | 说明 |
 |---|---|
-| 多平台解析 | 抖音、B站、YouTube 三个经过完整验证的解析器；另有 `WebMediaGrabber` 网页媒体抓取兜底 |
+| 多平台解析 | 抖音、B站、YouTube、腾讯视频（`v.qq.com`）解析器；另有 `WebMediaGrabber` 网页媒体抓取兜底 |
 | 画质选档 | 4K / 1080P+ / 1080P / 720P / 480P … 按档位枚举成独立条目，前端分组可选 |
 | 下载编排 | 多条目并发下载（可设"同时下载数"），任务级**暂停 / 恢复 / 取消** |
 | 字幕封装 | 解析到字幕轨即自动下载并内封进视频：B站专有 JSON→VTT 转换、YouTube captionTracks、HLS（m3u8）自动提取 |
@@ -30,6 +30,8 @@ Windows 桌面视频下载器：把命令行视频下载引擎 `vd` 封装成带
 | 单实例 | 重复打开会聚焦已有窗口并提醒，绝不杀掉正在启动的实例 |
 | 工具捆绑 | `N_m3u8DL-RE`（HLS/m3u8）、`aria2c`（多线程）随包分发；ffmpeg/ffprobe 依赖系统 PATH |
 | 版本管理 | 每次打包自动递增版本号（`version.txt` 为唯一真源），并用于安装/激活数据上报 |
+| 多语言 | 中英文，默认中文。语言存 `config.language` + `localStorage['vd_lang']`；首次打开（`language` 为空）自动弹一次语言选择（高亮当前语言），之后点顶栏地球图标可随时切换 |
+| 解析失败引导 | 任何平台只要一条有效链接都没解析到，统一提示「请先登录该平台后重试」（顶部弹窗停留 5 秒）；原始错误收进提示悬停，结果卡片不再直接铺长串错误 |
 
 ---
 
@@ -181,6 +183,7 @@ dist\VideoDLDesktop\VideoDLDesktop.exe --selftest
 | `allowed_sources` | 启用的解析器类名列表 |
 | `per_source_cookies` | 平台登录态（登录弹窗自动写入，键 = 解析器类名） |
 | `proxy` | 代理（`host:port`，空 = 直连） |
+| `language` | 界面语言：`zh-CN` / `en-US`；空 = 尚未选择，首次打开会弹语言选择 |
 
 同目录下还有诊断日志，排查启动/卡死问题第一现场：
 - `Logs\startup.log`（进程级事件，每行带耗时/内存/线程）
@@ -195,6 +198,7 @@ dist\VideoDLDesktop\VideoDLDesktop.exe --selftest
 - YouTube 存在**出口 IP 临时降权**（小时~天级自动恢复），期间所有工具（含 yt-dlp、
   YoutubeDownloader）会同时失效，属网络时变状态，不是代码缺陷。
 - 引擎解析内部异常只能引导用户重新解析（根因在引擎对源站数据结构的假设）。
+- **腾讯视频**：支持 `v.qq.com/x/cover/...` 与 `/x/page/...`；清晰度按接口返回的 `fl.fi` 真实档位枚举（实测常见 480P / 720P，随片源而定，不必强求 1080P）。仅支持单段片源，多段片源（`fn` 形如 `a.p201.1.mp4`）未做分段拼接，取不到完整地址时回落到 `WebMediaGrabber` 抓取。
 
 ---
 

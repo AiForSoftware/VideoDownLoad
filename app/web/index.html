@@ -3,8 +3,9 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>全能下载器</title>
+<title data-i18n="title">全能下载器</title>
 <link rel="stylesheet" href="styles.css" />
+<script src="i18n.js"></script>
 </head>
 <body>
 <header class="topbar">
@@ -13,22 +14,25 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>
         </div>
         <div class="brand-text">
-            <h1>全能<span>下载器</span></h1>
+            <h1><span data-i18n="brand_1">全能</span><span data-i18n="brand_2">下载器</span></h1>
             <p id="versionLabel">All-in-One Downloader</p>
         </div>
     </div>
     <div class="topbar-right">
-        <div class="chip" id="engineChip"><span class="dot"></span><span>引擎加载中</span></div>
-        <button class="icon-btn" id="themeBtn" title="切换配色（深空 / 翡翠 / 落日）">
+        <div class="chip" id="engineChip"><span class="dot"></span><span data-i18n="engine_loading">引擎加载中</span></div>
+        <button class="icon-btn" id="themeBtn" data-i18n-title="theme_toggle" title="切换配色（深空 / 翡翠 / 落日）">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 0 0 18c1.2 0 2-.9 2-2 0-.6-.2-1-.5-1.4-.3-.4-.5-.9-.5-1.4 0-1.1.9-2 2-2h2.4c1.9 0 3.6-1.5 3.6-3.4C21 6.6 17 3 12 3Z"/><circle cx="7.5" cy="11.5" r="1" fill="currentColor" stroke="none"/><circle cx="11" cy="7.5" r="1" fill="currentColor" stroke="none"/><circle cx="15.5" cy="9.5" r="1" fill="currentColor" stroke="none"/></svg>
         </button>
-        <button class="icon-btn" id="loginBtn" title="平台登录态（扫码/账号登录，自动保存 Cookie）">
+        <button class="icon-btn" id="loginBtn" data-i18n-title="login_title" title="平台登录态（扫码/账号登录，自动保存 Cookie）">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-6.5 8-6.5s8 2.5 8 6.5"/></svg>
         </button>
-        <button class="icon-btn" id="settingsBtn" title="设置">
+        <button class="icon-btn" id="langBtn" data-i18n-title="lang_switch" title="切换语言">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a15 15 0 0 1 0 18a15 15 0 0 1 0-18"/></svg>
+        </button>
+        <button class="icon-btn" id="settingsBtn" data-i18n-title="settings_title" title="设置">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2V21a2 2 0 0 1-4 0v-.1A1.7 1.7 0 0 0 7 19.4a1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.7 1.7 0 0 0 2 15a1.7 1.7 0 0 0-1.2-1H1a2 2 0 0 1 0-4h.1A1.7 1.7 0 0 0 2.6 9a1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.7 1.7 0 0 0 9 4.6h.1A1.7 1.7 0 0 0 10 3.4V3a2 2 0 0 1 4 0v.1a1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0 1.2 2.9H21a2 2 0 0 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
         </button>
-        <button class="text-btn" id="feedbackBtn">更新与反馈</button>
+        <button class="text-btn" id="feedbackBtn" data-i18n="feedback">更新与反馈</button>
     </div>
 </header>
 
@@ -36,47 +40,47 @@
     <section class="col-left">
         <div class="card">
             <div class="url-row">
-                <textarea id="urlInput" rows="2" placeholder="粘贴视频链接，一行一个，可批量解析；例如 https://www.bilibili.com/video/BV..." spellcheck="false"></textarea>
+                <textarea id="urlInput" rows="2" data-i18n-ph="url_ph" placeholder="粘贴视频链接，一行一个，可批量解析；例如 https://www.bilibili.com/video/BV..." spellcheck="false"></textarea>
                 <button id="parseBtn" class="btn primary">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
-                    解析
+                    <span data-i18n="parse">解析</span>
                 </button>
             </div>
-            <div class="hint" id="parseHint">输入链接后回车即可解析；支持 90+ 平台解析器与通用解析器兜底。</div>
+            <div class="hint" id="parseHint" data-i18n="parse_hint">输入链接后回车即可解析；支持 90+ 平台解析器与通用解析器兜底。</div>
         </div>
 
         <div class="card results-card">
             <div class="card-head">
-                <h2>解析结果 <span class="count" id="resultCount">0</span></h2>
+                <h2><span data-i18n="results">解析结果</span> <span class="count" id="resultCount">0</span></h2>
                 <div class="head-actions">
-                    <button class="btn ghost sm" id="selectAllBtn">全选</button>
-                    <button class="btn ghost sm" id="selectNoneBtn">取消</button>
+                    <button class="btn ghost sm" id="selectAllBtn" data-i18n="select_all">全选</button>
+                    <button class="btn ghost sm" id="selectNoneBtn" data-i18n="select_none">取消</button>
                 </div>
             </div>
             <div class="results" id="results">
                 <div class="empty">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="14" rx="2"/><path d="m9 9 6 4-6 4z"/></svg>
-                    <p>还没有解析结果</p>
+                    <p data-i18n="no_results">还没有解析结果</p>
                 </div>
             </div>
             <div class="download-bar">
-                <div class="save-to">保存到：<span id="workDirLabel">-</span></div>
+                <div class="save-to"><span data-i18n="save_to">保存到：</span><span id="workDirLabel">-</span></div>
                 <button class="btn primary" id="downloadBtn" disabled>
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>
-                    下载选中 <span id="selectedCount">0</span>
+                    <span data-i18n="download_selected">下载选中</span> <span id="selectedCount">0</span>
                 </button>
             </div>
         </div>
 
         <div class="card history-card">
             <div class="card-head">
-                <h2>历史下载 <span class="count" id="historyCount">0</span></h2>
+                <h2><span data-i18n="history">历史下载</span> <span class="count" id="historyCount">0</span></h2>
                 <div class="head-actions">
-                    <button class="btn ghost sm" id="clearHistoryBtn">清空</button>
+                    <button class="btn ghost sm" id="clearHistoryBtn" data-i18n="clear">清空</button>
                 </div>
             </div>
             <div class="history" id="historyList">
-                <div class="empty sm"><p>暂无历史记录，解析过的链接会自动保存到这里</p></div>
+                <div class="empty sm"><p data-i18n="no_history">暂无历史记录，解析过的链接会自动保存到这里</p></div>
             </div>
         </div>
     </section>
@@ -84,27 +88,26 @@
     <section class="col-right">
         <div class="card jobs-card">
             <div class="card-head">
-                <h2>下载队列</h2>
+                <h2 data-i18n="jobs">下载队列</h2>
                 <div class="head-actions">
-                    <button class="btn ghost sm" id="clearJobsBtn">清空已完成</button>
-                    <button class="btn ghost sm" id="openDirBtn">打开目录</button>
+                    <button class="btn ghost sm" id="clearJobsBtn" data-i18n="clear_done">清空已完成</button>
+                    <button class="btn ghost sm" id="openDirBtn" data-i18n="open_dir">打开目录</button>
                 </div>
             </div>
-            <div class="progress-list" id="progressList"></div>
             <div class="jobs" id="jobs">
-                <div class="empty sm"><p>暂无下载任务</p></div>
+                <div class="empty sm"><p data-i18n="no_jobs">暂无下载任务</p></div>
             </div>
         </div>
 
         <!-- 运行日志默认收起：右下角浮标，点击后以浮层展开，不再占据主界面空间 -->
-        <button class="logs-fab" id="logsFab" title="运行日志">日志<span class="badge" id="logsFabBadge"></span></button>
+        <button class="logs-fab" id="logsFab" data-i18n-title="logs" title="运行日志"><span data-i18n="logs_fab">日志</span><span class="badge" id="logsFabBadge"></span></button>
         <div class="card logs-card" id="logsCard">
             <div class="card-head">
-                <h2>运行日志</h2>
+                <h2 data-i18n="logs">运行日志</h2>
                 <div class="head-actions">
-                    <button class="btn ghost sm" id="logFilterBtn" title="过滤掉 info/debug，只看警告和错误">精简</button>
-                    <button class="btn ghost sm" id="toggleLogsBtn" title="收起到右下角">收起</button>
-                    <button class="btn ghost sm" id="clearLogsBtn">清空</button>
+                    <button class="btn ghost sm" id="logFilterBtn" data-i18n="logs_concise" data-i18n-title="logs_concise_tip" title="过滤掉 info/debug，只看警告和错误">精简</button>
+                    <button class="btn ghost sm" id="toggleLogsBtn" data-i18n="logs_collapse" data-i18n-title="logs_collapse_tip" title="收起到右下角">收起</button>
+                    <button class="btn ghost sm" id="clearLogsBtn" data-i18n="clear_logs">清空</button>
                 </div>
             </div>
             <div class="logs" id="logs"></div>
@@ -115,58 +118,57 @@
 <div class="modal-mask" id="settingsModal" hidden>
     <div class="modal">
         <div class="modal-head">
-            <h2>设置</h2>
+            <h2 data-i18n="settings">设置</h2>
             <button class="icon-btn" id="closeSettingsBtn">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
             </button>
         </div>
         <div class="modal-body">
             <label class="field">
-                <span>保存目录</span>
+                <span data-i18n="work_dir">保存目录</span>
                 <div class="row">
                     <input id="cfgWorkDir" type="text" spellcheck="false" />
-                    <button class="btn ghost" id="pickDirBtn">浏览</button>
+                    <button class="btn ghost" id="pickDirBtn" data-i18n="browse">浏览</button>
                 </div>
             </label>
             <label class="field">
-                <span>单任务线程数</span>
+                <span data-i18n="threads">单任务线程数</span>
                 <input id="cfgThreads" type="number" min="1" max="32" />
             </label>
             <label class="field">
-                <span>同时下载数</span>
+                <span data-i18n="concurrent">同时下载数</span>
                 <input id="cfgConcurrent" type="number" min="1" max="16" />
             </label>
             <label class="field">
-                <span>代理（可选，例如 127.0.0.1:7890）</span>
-                <input id="cfgProxy" type="text" spellcheck="false" placeholder="留空则不使用代理" />
+                <span data-i18n="proxy">代理（可选，例如 127.0.0.1:7890）</span>
+                <input id="cfgProxy" type="text" spellcheck="false" data-i18n-ph="proxy_ph" placeholder="留空则不使用代理" />
             </label>
             <label class="field">
-                <span>默认画质（解析后默认选中的清晰度）</span>
+                <span data-i18n="quality">默认画质（解析后默认选中的清晰度）</span>
                 <select id="cfgQuality">
-                    <option value="best">最高画质</option>
+                    <option value="best" data-i18n="quality_best">最高画质</option>
                     <option value="4k">4K</option>
                     <option value="1080p">1080P</option>
                     <option value="720p">720P</option>
                     <option value="480p">480P</option>
                     <option value="360p">360P</option>
-                    <option value="auto">由解析结果决定（全选）</option>
+                    <option value="auto" data-i18n="quality_auto">由解析结果决定（全选）</option>
                 </select>
             </label>
-            <label class="field checkbox" title="同时把字幕轨压制进视频文件；支持 HLS 自动提取字幕，个别平台需要对应解析器支持，不支持时自动跳过">
+            <label class="field checkbox" data-i18n-title="subtitles_tip" title="同时把字幕轨压制进视频文件；支持 HLS 自动提取字幕，个别平台需要对应解析器支持，不支持时自动跳过">
                 <input id="cfgSubtitles" type="checkbox" />
-                <span>同时下载字幕并合并到视频</span>
+                <span data-i18n="subtitles">同时下载字幕并合并到视频</span>
             </label>
             <div class="field">
-                <span>平台白名单（勾选即启用；默认仅启用 抖音 + 哔哩哔哩）</span>
-                <div class="source-grid" id="sourceGrid"><div class="empty sm"><p>引擎加载后可用</p></div></div>
+                <span data-i18n="whitelist">平台白名单（勾选即启用）</span>
+                <div class="source-grid" id="sourceGrid"><div class="empty sm"><p data-i18n="engine_loading_hint">引擎加载后可用</p></div></div>
             </div>
-            <div class="tools" id="toolsInfo"></div>
         </div>
         <div class="modal-foot">
-            <button class="btn ghost" id="openConfigDirBtn">打开配置目录</button>
+            <button class="btn ghost" id="openConfigDirBtn" data-i18n="open_config_dir">打开配置目录</button>
             <div class="spacer"></div>
-            <button class="btn ghost" id="cancelSettingsBtn">取消</button>
-            <button class="btn primary" id="saveSettingsBtn">保存</button>
+            <button class="btn ghost" id="cancelSettingsBtn" data-i18n="cancel">取消</button>
+            <button class="btn primary" id="saveSettingsBtn" data-i18n="save">保存</button>
         </div>
     </div>
 </div>
@@ -174,22 +176,22 @@
 <div class="modal-mask" id="loginModal" hidden>
     <div class="modal">
         <div class="modal-head">
-            <h2>平台登录态</h2>
+            <h2 data-i18n="login_modal">平台登录态</h2>
             <button class="icon-btn" id="closeLoginBtn">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
             </button>
         </div>
         <div class="modal-body">
-            <p class="hint" style="margin:0 0 10px;">点击「登录」后会弹出浏览器窗口，扫码/账号登录即可自动保存 Cookie；已登录的平台在解析/下载时会自动带上登录态。</p>
-            <div class="login-grid" id="loginGrid"><div class="empty sm"><p>引擎加载后可用</p></div></div>
+            <p class="hint" style="margin:0 0 10px;" data-i18n="login_hint">点击「登录」后会弹出浏览器窗口，扫码/账号登录即可自动保存 Cookie；已登录的平台在解析/下载时会自动带上登录态。</p>
+            <div class="login-grid" id="loginGrid"><div class="empty sm"><p data-i18n="engine_loading_hint">引擎加载后可用</p></div></div>
             <div class="field" id="cookieEditorField" style="margin-top:16px;">
-                <span>平台 Cookie（不支持自动登录的平台可在此手动填写完整 Cookie 字符串）</span>
-                <div id="sourceCookies"><div class="empty sm"><p>引擎加载后可用</p></div></div>
+                <span data-i18n="platform_cookie">平台 Cookie（不支持自动登录的平台可在此手动填写完整 Cookie 字符串）</span>
+                <div id="sourceCookies"><div class="empty sm"><p data-i18n="engine_loading_hint">引擎加载后可用</p></div></div>
             </div>
         </div>
         <div class="modal-foot">
             <div class="spacer"></div>
-            <button class="btn primary" id="saveCookiesBtn">保存 Cookie</button>
+            <button class="btn primary" id="saveCookiesBtn" data-i18n="save_cookie">保存 Cookie</button>
         </div>
     </div>
 </div>
@@ -197,18 +199,34 @@
 <div class="modal-mask" id="feedbackModal" hidden>
     <div class="modal">
         <div class="modal-head">
-            <h2>更新与反馈</h2>
+            <h2 data-i18n="feedback_title">更新与反馈</h2>
             <button class="icon-btn" id="closeFeedbackBtn">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
             </button>
         </div>
         <div class="modal-body feedback-body">
-            <div class="qr-wrap"><img class="qr-img" src="../assets/qrcode_for_gh_95d87017d959_344.jpg" alt="公众号二维码" /></div>
-            <p class="qr-tip">扫描上方二维码关注公众号，<b>获取最新软件与版本更新</b>；<br/>如有使用建议或问题，欢迎在公众号留言反馈。</p>
+            <div class="qr-wrap"><img class="qr-img" src="../assets/qrcode_for_gh_95d87017d959_344.jpg" data-i18n-alt="qr_alt" alt="公众号二维码" /></div>
+            <p class="qr-tip" data-i18n="qr_tip">扫描上方二维码关注公众号，<b>获取最新软件与版本更新</b>；<br/>如有使用建议或问题，欢迎在公众号留言反馈。</p>
         </div>
         <div class="modal-foot">
             <div class="spacer"></div>
-            <button class="btn ghost" id="closeFeedbackBtn2">关闭</button>
+            <button class="btn ghost" id="closeFeedbackBtn2" data-i18n="close">关闭</button>
+        </div>
+    </div>
+</div>
+
+<!-- 首启语言选择弹窗：文案固定中英双语 —— 弹出此刻用户语言尚未确定，不能跟随 i18n -->
+<div class="modal-mask" id="langModal" hidden>
+    <div class="modal">
+        <div class="modal-head">
+            <h2>选择语言 <span style="opacity:.55;font-weight:400;font-size:.85em;">/ Choose Language</span></h2>
+        </div>
+        <div class="modal-body">
+            <p class="hint" style="margin:0 0 12px;">请选择界面语言，之后可在顶栏随时切换。<br/>Pick your interface language — you can switch it anytime from the top bar.</p>
+            <div class="login-grid">
+                <button class="btn primary" id="langZhBtn">简体中文</button>
+                <button class="btn ghost" id="langEnBtn">English</button>
+            </div>
         </div>
     </div>
 </div>

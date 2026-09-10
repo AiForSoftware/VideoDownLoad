@@ -47,6 +47,10 @@ _EAGER_PARSERS = [
     ('douyin', 'DouyinVideoClient'),
     ('bilibili', 'BilibiliVideoClient'),
     ('youtube', 'YouTubeVideoClient'),
+    # 'qq' and not 'vqq': module_name must be a SUBSTRING of the hostname
+    # (v.qq.com) and a module name cannot contain a dot, so 'vqq' / 'v.qq'
+    # would silently never match.
+    ('qq', 'TencentVideoClient'),
 ]
 
 

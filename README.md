@@ -2,8 +2,9 @@
 
 A Windows desktop video downloader: it wraps the command-line download engine `vd` in a
 GUI shell (pywebview + Edge WebView2) and supports parsing, quality selection, concurrent
-downloading and task-level pause/resume for **Douyin / Bilibili / YouTube**, plus
-**automatic subtitle download and muxing into the video**.
+downloading and task-level pause/resume for **Douyin / Bilibili / YouTube / Tencent Video**,
+plus **automatic subtitle download and muxing into the video**. The UI ships in
+**Chinese and English** (Chinese by default; a language picker is shown on first launch).
 
 ---
 
@@ -24,7 +25,7 @@ downloading and task-level pause/resume for **Douyin / Bilibili / YouTube**, plu
 
 | Feature | Description |
 |---|---|
-| Multi-platform parsing | Douyin, Bilibili and YouTube parsers, all fully verified; `WebMediaGrabber` as a generic web-media fallback |
+| Multi-platform parsing | Douyin, Bilibili, YouTube and Tencent Video (`v.qq.com`) parsers; `WebMediaGrabber` as a generic web-media fallback |
 | Quality selection | 4K / 1080P+ / 1080P / 720P / 480P … enumerated as separate entries, grouped in the UI |
 | Download orchestration | Concurrent downloads (configurable "simultaneous downloads"), task-level **pause / resume / cancel** |
 | Subtitle muxing | Subtitle tracks are downloaded and muxed in automatically: Bilibili proprietary JSON→VTT, YouTube captionTracks, HLS (m3u8) auto-extraction |
@@ -33,6 +34,8 @@ downloading and task-level pause/resume for **Douyin / Bilibili / YouTube**, plu
 | Single instance | Re-opening focuses the existing window and shows a reminder — it never kills a launch in progress |
 | Bundled tools | `N_m3u8DL-RE` (HLS/m3u8) and `aria2c` (multi-threaded) ship with the package; ffmpeg/ffprobe come from the system PATH |
 | Version management | The version auto-increments on every build (`version.txt` is the single source of truth) and is used for install/activation reporting |
+| Multilingual | Chinese / English (Chinese by default). Stored in `config.language` + `localStorage['vd_lang']`; the first launch (`language` empty) shows a one-time picker with the current language highlighted, and the top-bar globe icon switches it anytime |
+| Parse-failure guidance | When no valid link is parsed on any platform, one clear prompt says "log in to this platform and retry" (top toast, 5s); the raw error stays available on hover instead of flooding the result card |
 
 ---
 
@@ -191,6 +194,7 @@ Config file: `C:\Users\<you>\AppData\Local\vd\vd-desktop\config.json`
 | `allowed_sources` | list of enabled parser class names |
 | `per_source_cookies` | per-platform login state (written by the login dialog) |
 | `proxy` | proxy (`host:port`, empty = direct) |
+| `language` | UI language: `zh-CN` / `en-US`; empty = not chosen yet (a one-time picker is shown on first launch) |
 
 Diagnostic logs live in the same directory — the first place to look when startup hangs:
 - `Logs\startup.log` (process-level events with timing / memory / threads per line)
@@ -207,6 +211,10 @@ Diagnostic logs live in the same directory — the first place to look when star
 - YouTube applies **temporary IP throttling** (recovers over hours to days). During that
   window every tool — including yt-dlp and YoutubeDownloader — fails at once. This is a
   network state, not a code defect.
+- **Tencent Video**: supports `v.qq.com/x/cover/...` and `/x/page/...`; qualities are
+  enumerated from the `fl.fi` list returned by the API (commonly 480P / 720P, depends on
+  the title — 1080P is not guaranteed). Single-segment sources only: multi-segment sources
+  (`fn` like `a.p201.1.mp4`) are not stitched and fall back to `WebMediaGrabber`.
 - Internal engine parse errors can only be surfaced as "please parse again"; the root cause
   lies in the engine's assumptions about site data structures.
 

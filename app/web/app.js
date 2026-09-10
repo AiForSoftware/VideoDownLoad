@@ -34,11 +34,11 @@ const state = {
     wantSources: false,
 };
 
-const STATUS_TEXT = {
-    queued: '排队中', downloading: '下载中', done: '已完成',
-    error: '失败', cancelled: '已取消', cancelling: '取消中',
-    paused: '已暂停', pausing: '暂停中', resuming: '恢复中',
-};
+// Proxy, not a plain object: the strings must follow the CURRENT language —
+// a literal object would freeze the values captured at load time.
+const STATUS_TEXT = new Proxy({}, {
+    get: (_target, key) => (typeof key === 'string' ? I18N.t('status_' + key) : undefined),
+});
 
 const ICONS = {
     play: '<svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M8 5v14l11-7z"/></svg>',
@@ -69,18 +69,18 @@ function api(name) {
             n += 1;
             const r = _call();
             if (r) { clearInterval(t); resolve(r); return; }
-            if (n > 40) { clearInterval(t); reject(new Error('pywebview 尚未就绪')); }
+            if (n > 40) { clearInterval(t); reject(new Error(I18N.t('ready'))); }
         }, 75);
     });
 }
 
-function toast(message, kind) {
+function toast(message, kind, duration) {
     const el = $('toast');
     el.textContent = message;
     el.className = 'toast' + (kind ? ' ' + kind : '');
     el.hidden = false;
     clearTimeout(el._timer);
-    el._timer = setTimeout(() => { el.hidden = true; }, 2600);
+    el._timer = setTimeout(() => { el.hidden = true; }, duration || 2600);
 }
 
 /* frontend diagnostics: forward anchors into the python-side startup.log */
@@ -103,9 +103,9 @@ window.addEventListener('unhandledrejection', (e) => {
 
 /* ---------------- theme (3 palettes, persisted) ---------------- */
 const THEMES = [
-    { id: 'space', label: '深空' },
-    { id: 'emerald', label: '翡翠' },
-    { id: 'sunset', label: '落日' },
+    { id: 'space', get label() { return I18N.t('theme_space'); } },
+    { id: 'emerald', get label() { return I18N.t('theme_emerald'); } },
+    { id: 'sunset', get label() { return I18N.t('theme_sunset'); } },
 ];
 function currentTheme() {
     const saved = localStorage.getItem('vd_theme');
@@ -120,7 +120,7 @@ applyTheme(currentTheme());
 function cycleTheme() {
     const next = THEMES[(THEMES.findIndex((t) => t.id === currentTheme()) + 1) % THEMES.length];
     applyTheme(next.id);
-    toast(`配色已切换：${next.label}`, 'ok');
+    toast(I18N.t('theme_switched', { name: next.label }), 'ok');
 }
 
 /* ---------------- formatting ---------------- */
@@ -146,7 +146,7 @@ function renderResults() {
     const box = $('results');
     $('resultCount').textContent = String(state.items.length);
     if (!state.items.length) {
-        box.innerHTML = '<div class="empty"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="14" rx="2"/><path d="m9 9 6 4-6 4z"/></svg><p>还没有解析结果</p></div>';
+        box.innerHTML = `<div class="empty"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="14" rx="2"/><path d="m9 9 6 4-6 4z"/></svg><p>${I18N.t('no_results')}</p></div>`;
         return;
     }
     box.innerHTML = state.items.map((item) => {
@@ -158,17 +158,15 @@ function renderResults() {
             `<span class="tag source">${esc(shortname(item.source))}</span>`,
             item.quality ? `<span class="tag q">${esc(item.quality)}</span>` : '',
             item.ext && item.valid ? `<span class="tag ext">${esc(item.ext)}</span>` : '',
-            item.has_audio ? '<span class="tag good">含音频流</span>' : '',
-            item.valid ? '' : '<span class="tag bad">无有效地址</span>',
+            item.has_audio ? `<span class="tag good">${I18N.t('tag_has_audio')}</span>` : '',
+            item.valid ? '' : `<span class="tag bad">${I18N.t('tag_no_valid')}</span>`,
         ].join('');
         const tooltip = [item.err_msg, item.save_path || item.download_url].filter(Boolean).join('\n');
-        const errLine = item.err_msg ? `<div class="result-err" style="margin-top:4px;font-size:11px;color:#f87171;line-height:1.4;word-break:break-all" title="${esc(item.err_msg)}">${esc(item.err_msg.length > 140 ? item.err_msg.slice(0,140) + '\u2026' : item.err_msg)}</div>` : '';
         return `<div class="result-item${on}" data-key="${esc(item.key)}" title="${esc(tooltip)}">
             ${thumb}
             <div class="result-main">
                 <div class="result-title">${esc(item.title)}</div>
                 <div class="result-meta">${tags}</div>
-                ${errLine}
             </div>
             <div class="result-check"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="m5 13 4 4L19 7"/></svg></div>
         </div>`;
@@ -197,10 +195,10 @@ function updateDownloadBtn() {
 // 把条目下的进度任务按"流"拆开：视频 / 音频 / 字幕 / 合并封装。
 // 之前是把所有流混成一条百分比，音频有没有在跑、有没有下完完全看不出来。
 const STREAM_GROUPS = [
-    { label: '视频', kinds: ['download', 'm3u8download'] },
-    { label: '音频', kinds: ['audio'] },
-    { label: '字幕', kinds: ['subtitle'] },
-    { label: '合并/封装', kinds: ['packaging'] },
+    { get label() { return I18N.t('group_video'); }, kinds: ['download', 'm3u8download'] },
+    { get label() { return I18N.t('group_audio'); }, kinds: ['audio'] },
+    { get label() { return I18N.t('group_subtitle'); }, kinds: ['subtitle'] },
+    { get label() { return I18N.t('group_merge'); }, kinds: ['packaging'] },
 ];
 
 // 一条流算"完成"的条件是跑到了 100%——引擎有时会把已完成任务移除（finished=true），
@@ -236,10 +234,10 @@ function groupStreams(tasks) {
 
 const fmteta = (s) => {
     if (s == null) return '';
-    if (s < 1) return '即将完成';
-    if (s < 60) return `剩余 ${s.toFixed(0)} 秒`;
-    if (s < 3600) return `剩余 ${Math.floor(s / 60)} 分 ${Math.floor(s % 60)} 秒`;
-    return `剩余 ${Math.floor(s / 3600)} 时 ${Math.floor((s % 3600) / 60)} 分`;
+    if (s < 1) return I18N.t('eta_soon');
+    if (s < 60) return I18N.t('eta_sec', { s: s.toFixed(0) });
+    if (s < 3600) return I18N.t('eta_min', { m: Math.floor(s / 60), s: Math.floor(s % 60) });
+    return I18N.t('eta_hour', { h: Math.floor(s / 3600), m: Math.floor((s % 3600) / 60) });
 };
 
 function renderItemProgress(job, item) {
@@ -254,10 +252,10 @@ function renderItemProgress(job, item) {
             ? (g.totalBytes - g.doneBytes) / g.speedSum : null;
         let detail;
         if (g.finished) {
-            detail = `✓ 完成 · ${fmtbytes(g.doneBytes)}`;
+            detail = I18N.t('done_with_size', { size: fmtbytes(g.doneBytes) });
         } else if (!g.hasTotal) {
             // 封装阶段没有总量（ffmpeg 不回报进度），显示"处理中…"而不是 0 B
-            detail = '处理中…';
+            detail = I18N.t('processing');
         } else {
             detail = `${fmtbytes(g.doneBytes)} / ${fmtbytes(g.totalBytes)} · ${g.percent.toFixed(1)}%`;
             // Always surface the per-second speed, even when it is 0 (e.g. right
@@ -337,7 +335,7 @@ function updateJobProgress(jobs) {
 function renderJobs() {
     const box = $('jobs');
     if (!state.jobs.length) {
-        box.innerHTML = '<div class="empty sm"><p>暂无下载任务</p></div>';
+        box.innerHTML = `<div class="empty sm"><p>${I18N.t('no_jobs')}</p></div>`;
         state._jobSnapshot = '';
         return;
     }
@@ -382,26 +380,26 @@ function renderJobs() {
 
         // Icon-only action bar. Folder is always available; pause/resume changes
         // depending on the job state. This stops the folder icon from flashing on/off.
-        const folderBtn = `<button class="icon-btn job-action" data-open="${esc(job.id)}" title="打开文件所在目录">${ICONS.folder}</button>`;
+        const folderBtn = `<button class="icon-btn job-action" data-open="${esc(job.id)}" title="${I18N.t('tip_open_file_dir')}">${ICONS.folder}</button>`;
         let stateBtn = '';
         if (job.status === 'downloading' || job.status === 'queued' || job.status === 'pausing') {
-            stateBtn = `<button class="icon-btn job-action" data-pause="${esc(job.id)}" title="暂停">${ICONS.pause}</button>`;
+            stateBtn = `<button class="icon-btn job-action" data-pause="${esc(job.id)}" title="${I18N.t('tip_pause')}">${ICONS.pause}</button>`;
         } else if (job.status === 'paused' || job.status === 'error') {
-            stateBtn = `<button class="icon-btn job-action primary" data-resume="${esc(job.id)}" title="开始/继续">${ICONS.play}</button>`;
+            stateBtn = `<button class="icon-btn job-action primary" data-resume="${esc(job.id)}" title="${I18N.t('tip_resume')}">${ICONS.play}</button>`;
         }
         // While resuming the backend is reparsing on a background thread; hide the
         // play button so the user cannot trigger duplicate resume calls.
-        const cancelTitle = ['done', 'error', 'cancelled'].includes(job.status) ? '移除' : '取消';
+        const cancelTitle = ['done', 'error', 'cancelled'].includes(job.status) ? I18N.t('tip_remove') : I18N.t('cancel');
         // "补音频" appears for finished (done/error) jobs so a silent-video result
         // can be repaired by re-downloading just the audio + re-merging.
         const retryAudioBtn = (job.status === 'done' || job.status === 'error')
-            ? `<button class="icon-btn job-action primary" data-retryaudio="${esc(job.id)}" title="补音频并重新合并">${ICONS.audio}</button>`
+            ? `<button class="icon-btn job-action primary" data-retryaudio="${esc(job.id)}" title="${I18N.t('tip_retry_audio')}">${ICONS.audio}</button>`
             : '';
         const actions = `${stateBtn}${folderBtn}${retryAudioBtn}<button class="icon-btn job-action danger" data-cancel="${esc(job.id)}" title="${esc(cancelTitle)}">${ICONS.cancel}</button>`;
 
         const time = esc(job.finished_at || job.started_at || job.created_at);
         const remaining = Math.max(0, (job.total_count || 0) - (job.done_count || 0));
-        const headerMeta = `⏱ ${time} · 📦 ${job.done_count || 0}/${job.total_count || 0} 剩 ${remaining}`;
+        const headerMeta = I18N.t('job_meta', { time: time, done: job.done_count || 0, total: job.total_count || 0, remaining: remaining });
         const badge = (job.status === 'done' || job.status === 'downloading')
             ? ''
             : `<span class="job-status ${esc(job.status)}">${esc(STATUS_TEXT[job.status] || job.status)}</span>`;
@@ -464,14 +462,22 @@ function setLogsOpen(open) {
     }
 }
 
-function renderToolChips() {
-    const box = $('toolChips');
-    if (!box) return; // tool chips were removed from the top bar
-    const map = [['ffmpeg', 'FFmpeg'], ['ffprobe', 'FFprobe'], ['node', 'Node'], ['nm3u8dlre', 'N_m3u8DL-RE'], ['aria2c', 'Aria2']];
-    box.innerHTML = map.map(([k, label]) => {
-        const on = !!state.tools[k];
-        return `<span class="tool-chip ${on ? 'on' : 'off'}">${on ? label : label + ' 缺失'}</span>`;
-    }).join('');
+/* ---------------- language ---------------- */
+function openLangModal() {
+    // 高亮当前已选语言，让用户一眼看出正在用哪个（而不是固定高亮中文）
+    $('langZhBtn').className = 'btn ' + (I18N.current === 'zh-CN' ? 'primary' : 'ghost');
+    $('langEnBtn').className = 'btn ' + (I18N.current === 'en-US' ? 'primary' : 'ghost');
+    $('langModal').hidden = false;
+}
+function closeLangModal() { $('langModal').hidden = true; }
+function chooseLang(lang) {
+    I18N.set(lang);
+    I18N.apply();
+    closeLangModal();
+    state.config = Object.assign({}, state.config, { language: lang });
+    api('setconfig', { language: lang }).then((r) => {
+        if (r && r.config) state.config = r.config;
+    }).catch(() => {});
 }
 
 function historySnapshot(history) {
@@ -481,7 +487,7 @@ function historySnapshot(history) {
 function renderHistory() {
     const box = $('historyList');
     if (!state.history.length) {
-        box.innerHTML = '<div class="empty sm"><p>暂无历史记录，解析过的链接会自动保存到这里</p></div>';
+        box.innerHTML = `<div class="empty sm"><p>${I18N.t('no_history')}</p></div>`;
         $('historyCount').textContent = '0';
         state._historySnapshot = '';
         return;
@@ -492,16 +498,16 @@ function renderHistory() {
         try { host = new URL(h.url).hostname.replace(/^www\./, ''); } catch (e) {}
         const src = shortname(h.source || '');
         const when = (h.last_used_at || h.parsed_at || '').slice(11, 19) || '-';
-        const tag = h.source ? `<span class="tag source">${esc(src)}</span>` : '<span class="tag">通用</span>';
+        const tag = h.source ? `<span class="tag source">${esc(src)}</span>` : `<span class="tag">${I18N.t('generic')}</span>`;
         return `<div class="history-item" data-url="${esc(h.url)}">
             <div class="history-main">
                 <div class="history-url" title="${esc(h.url)}">${esc(h.url)}</div>
                 <div class="history-meta">${tag} <span class="host">${esc(host)}</span> · <span class="when">${esc(when)}</span></div>
             </div>
             <div class="history-actions">
-                <button class="btn ghost sm" data-fill="${esc(h.url)}" title="仅填入地址栏">填入</button>
-                <button class="btn ghost sm primary-mini" data-use="${esc(h.url)}" title="填入并立即解析">解析</button>
-                <button class="btn ghost sm danger" data-del="${esc(h.url)}" title="从历史中删除">×</button>
+                <button class="btn ghost sm" data-fill="${esc(h.url)}" title="${I18N.t('tip_fill')}">${I18N.t('fill')}</button>
+                <button class="btn ghost sm primary-mini" data-use="${esc(h.url)}" title="${I18N.t('tip_fill_parse')}">${I18N.t('parse')}</button>
+                <button class="btn ghost sm danger" data-del="${esc(h.url)}" title="${I18N.t('tip_del_history')}">×</button>
             </div>
         </div>`;
     }).join('');
@@ -513,7 +519,7 @@ function renderEngineChip() {
     const st = state.engineState || 'unloaded';
     if (st === 'error' || state.engineError) {
         chip.className = 'chip err';
-        chip.innerHTML = '<span class="dot"></span><span>引擎加载失败</span>';
+        chip.innerHTML = `<span class="dot"></span><span>${I18N.t('engine_failed')}</span>`;
         return;
     }
     if (st === 'ready' && state.engineReady) {
@@ -522,23 +528,23 @@ function renderEngineChip() {
             // 解析器列表还在异步加载中，sources API 几毫秒内就会回来；
             // 这里显示 "加载中" 避免出现误导性的 "0 解析器"
             chip.className = 'chip warn';
-            chip.innerHTML = '<span class="dot"></span><span>引擎就绪 · 解析器列表加载中…</span>';
+            chip.innerHTML = `<span class="dot"></span><span>${I18N.t('engine_ready_loading_list')}</span>`;
             return;
         }
         // show the ENABLED (whitelisted) count first — the user opted into 2
         // platforms, so "107 解析器" was misleading; keep the total as context
         const enabled = state.checkedSources.size || 0;
         chip.className = 'chip ok';
-        chip.innerHTML = `<span class="dot"></span><span>引擎就绪 · 已启用 ${enabled}/${total} 解析器</span>`;
+        chip.innerHTML = `<span class="dot"></span><span>${I18N.t('engine_ready_enabled', { enabled, total })}</span>`;
         return;
     }
     if (st === 'loading') {
         chip.className = 'chip warn';
-        chip.innerHTML = '<span class="dot"></span><span>引擎加载中…</span>';
+        chip.innerHTML = `<span class="dot"></span><span>${I18N.t('engine_loading_ellipsis')}</span>`;
         return;
     }
     chip.className = 'chip';
-    chip.innerHTML = '<span class="dot"></span><span>引擎未加载（首次解析时自动加载）</span>';
+    chip.innerHTML = `<span class="dot"></span><span>${I18N.t('engine_not_loaded')}</span>`;
 }
 
 /* ---------------- polling ---------------- */
@@ -584,7 +590,7 @@ function applyState(data) {
     if (!prevEngineReady && state.engineReady && state.wantSources) loadSources();
     if (state.wantSources && !(state.platforms.length + state.generic.length)) loadSources();
     const busy = state.jobs.some((j) => j.status === 'downloading' || j.status === 'queued');
-    if (prevBusy && !busy && hadJobs) toast('下载任务已完成', 'ok');
+    if (prevBusy && !busy && hadJobs) toast(I18N.t('all_done'), 'ok');
     schedulePoll(busy);
 }
 
@@ -668,7 +674,7 @@ function initCheckedSources() {
 function renderSourceGrid() {
     const grid = $('sourceGrid');
     const all = state.platforms.concat(state.generic);
-    if (!all.length) { grid.innerHTML = '<div class="empty sm"><p>引擎加载后可用</p></div>'; return; }
+    if (!all.length) { grid.innerHTML = `<div class="empty sm"><p>${I18N.t('engine_loading_hint')}</p></div>`; return; }
     grid.innerHTML = all.map((name) => {
         const checked = state.checkedSources.has(name) ? ' checked' : '';
         return `<label class="source-item" title="${esc(name)}"><input type="checkbox" value="${esc(name)}"${checked} /><span>${esc(shortname(name))}</span></label>`;
@@ -678,13 +684,13 @@ function renderSourceGrid() {
 function renderSourceCookies() {
     const box = $('sourceCookies');
     const all = state.platforms.concat(state.generic);
-    if (!all.length) { box.innerHTML = '<div class="empty sm"><p>引擎加载后可用</p></div>'; return; }
+    if (!all.length) { box.innerHTML = `<div class="empty sm"><p>${I18N.t('engine_loading_hint')}</p></div>`; return; }
     const cookies = (state.config && state.config.per_source_cookies) || {};
     box.innerHTML = all.map((name) => {
         const val = esc(cookies[name] || '');
         return `<label class="source-cookie" title="${esc(name)}">
             <span>${esc(shortname(name))}</span>
-            <textarea data-source="${esc(name)}" rows="2" spellcheck="false" placeholder="该平台的完整 Cookie 字符串">${val}</textarea>
+            <textarea data-source="${esc(name)}" rows="2" spellcheck="false" placeholder="${I18N.t('cookie_ph')}">${val}</textarea>
         </label>`;
     }).join('');
 }
@@ -707,41 +713,54 @@ function applyParseResult(data) {
     renderHistory();
     if (!res.ok) {
         $('parseHint').className = 'hint err';
-        $('parseHint').textContent = '解析失败：' + (res.error || '未知错误');
-        toast('解析失败：' + (res.error || '未知错误'), 'err');
+        $('parseHint').textContent = I18N.t('parse_failed', { err: res.error || I18N.t('unknown_error') });
+        toast(I18N.t('parse_failed', { err: res.error || I18N.t('unknown_error') }), 'err');
     } else if (!state.items.length) {
         $('parseHint').className = 'hint err';
-        $('parseHint').textContent = '未找到可下载的视频，可尝试点击顶栏「登录态」按钮登录该平台后重试';
+        $('parseHint').textContent = I18N.t('no_downloadable');
     } else if (state.items.every((i) => !i.valid)) {
         // Every parsed item has no real download URL (anti-bot / 412 / no cookie).
         // Surface the underlying reason and explicitly suggest a cookie so the
         // user knows what to do instead of staring at a cryptic tag.
-        const firstErr = (state.items.find((i) => i.err_msg) || {}).err_msg || '所有资源均无有效地址';
+        const firstErr = (state.items.find((i) => i.err_msg) || {}).err_msg || I18N.t('all_no_valid_url');
         const isAntiBot = /412|403|Precondition|FORBIDDEN|access.denied|Forbidden/i.test(firstErr);
         const isYouTube = /YouTube|youtube/i.test(firstErr);
+        // 抖音未登录被反爬时引擎抛的就是这句（douyin.py 三个候选全失败时），
+        // 此时对用户只说"请先登录"，原始长串收进 title 悬停可看。
+        const isDouyinNoLogin = firstErr.includes('未能从抖音页面提取');
         const hasAnyLogin = !!(state.config && state.config.per_source_cookies && Object.keys(state.config.per_source_cookies).length);
         $('parseHint').className = 'hint err';
-        if (isYouTube) {
-            $('parseHint').textContent = '解析失败：YouTube 反爬拦截（IP 被标记）。' + firstErr.slice(0, 200);
+        // 任何平台只要一条有效链接都没解析到，用户最可能缺的就是登录态 ——
+        // 统一提示"请先登录后重试"（5 秒），具体原因收进 title 悬停查看。
+        let _toastMsg, _toastMs = 5000;
+        if (isDouyinNoLogin) {
+            $('parseHint').textContent = I18N.t('douyin_login_required');
+            _toastMsg = I18N.t('douyin_login_required');
+        } else if (isYouTube) {
+            $('parseHint').textContent = I18N.t('parse_failed_youtube') + I18N.t('login_retry_suffix');
+            _toastMsg = I18N.t('login_required_generic');
         } else if (isAntiBot && !hasAnyLogin) {
-            $('parseHint').textContent = '解析失败：网站返回 412/403（反爬限制），所有资源均无有效地址。请点击顶栏「登录态」按钮登录该平台（抖音等）后重试。';
+            $('parseHint').textContent = I18N.t('parse_failed_403_login');
+            _toastMsg = I18N.t('login_required_generic');
         } else if (isAntiBot) {
-            $('parseHint').textContent = '解析失败：网站返回 412/403（反爬），所有资源均无有效地址。当前登录态可能已失效，请点击顶栏「登录态」按钮重新登录后重试。';
+            $('parseHint').textContent = I18N.t('parse_failed_403_relogin');
+            _toastMsg = I18N.t('login_required_generic');
         } else {
-            $('parseHint').textContent = '解析失败：所有资源均无有效地址（' + firstErr.slice(0, 200) + '）';
+            $('parseHint').textContent = I18N.t('login_required_generic');
+            _toastMsg = I18N.t('login_required_generic');
         }
         $('parseHint').title = firstErr;
-        toast('解析失败：所有资源均无有效地址', 'err');
+        toast(_toastMsg, 'err', _toastMs);
     } else {
         const cnt = state.items.length;
         $('parseHint').className = 'hint ok';
-        const _prefLabel = { best: '最高画质', auto: '全部画质' }[(state.config || {}).default_quality] || String((state.config || {}).default_quality || 'best').toUpperCase();
+        const _prefLabel = { best: I18N.t('quality_best'), auto: I18N.t('quality_all') }[(state.config || {}).default_quality] || String((state.config || {}).default_quality || 'best').toUpperCase();
         if (res.batch) {
             const ok = (res.url_count || 1) - (res.errors ? res.errors.length : 0);
-            const extra = (res.errors && res.errors.length) ? `（${res.errors.length} 个链接失败）` : '';
-            $('parseHint').textContent = `批量解析完成：${ok}/${res.url_count} 个链接成功，共 ${cnt} 个资源，已按「${_prefLabel}」选中 ${state.selected.size} 项${extra}`;
+            const extra = (res.errors && res.errors.length) ? I18N.t('n_links_failed', { n: res.errors.length }) : '';
+            $('parseHint').textContent = I18N.t('batch_parse_done', { ok: ok, total: res.url_count, cnt: cnt, q: _prefLabel, n: state.selected.size, extra: extra });
         } else {
-            $('parseHint').textContent = `解析成功，共 ${cnt} 个资源，已按「${_prefLabel}」选中 ${state.selected.size} 项`;
+            $('parseHint').textContent = I18N.t('parse_ok', { cnt: cnt, q: _prefLabel, n: state.selected.size });
         }
         $('urlInput').value = '';
     }
@@ -749,19 +768,19 @@ function applyParseResult(data) {
 
 function parseUrl() {
     const raw = $('urlInput').value.trim();
-    if (!raw) { toast('请输入视频链接', 'err'); return; }
+    if (!raw) { toast(I18N.t('enter_url'), 'err'); return; }
     // Split into one-or-many urls: one per line, or separated by spaces / commas
     // (full-width commas too). Enables batch parsing — a single url behaves
     // exactly as before.
     const urls = raw.split(/[\s,，;；]+/).map((s) => s.trim()).filter(Boolean);
-    if (!urls.length) { toast('请输入视频链接', 'err'); return; }
+    if (!urls.length) { toast(I18N.t('enter_url'), 'err'); return; }
     if (state.parsing) return;
     state.parsing = true;
     $('parseBtn').disabled = true;
     $('parseHint').className = 'hint';
     $('parseHint').textContent = ((state.engineState || 'unloaded') !== 'ready')
-        ? '首次使用需加载解析引擎，请稍候…（约 3~8 秒）'
-        : (urls.length > 1 ? `正在批量解析 ${urls.length} 个链接…` : '正在解析，请稍候…');
+        ? I18N.t('engine_first_load')
+        : (urls.length > 1 ? I18N.t('parsing_batch', { n: urls.length }) : I18N.t('parsing'));
     // Single url still goes through the per-url `parse` API; multiple urls use
     // `parsebatch`. Both push the merged result back via window.applyParseResult
     // (see JsApi.parse / parsebatch in api.py). The api() call only kicks off the
@@ -771,7 +790,7 @@ function parseUrl() {
         state.parsing = false;
         $('parseBtn').disabled = false;
         $('parseHint').className = 'hint err';
-        $('parseHint').textContent = '解析请求失败：' + err;
+        $('parseHint').textContent = I18N.t('parse_request_failed', { err: err });
     });
 }
 
@@ -779,10 +798,10 @@ function downloadSelected() {
     const keys = Array.from(state.selected);
     if (!keys.length) return;
     api('download', keys, state.config ? state.config.work_dir : null).then((res) => {
-        if (!res.ok) toast(res.error || '创建任务失败', 'err');
-        else if (res.count && res.count > 1) toast(`已创建 ${res.count} 个下载任务`);
-        else toast(`已创建下载任务 #${res.job_id}`);
-    }).catch((err) => toast('创建任务失败：' + err, 'err'));
+        if (!res.ok) toast(res.error || I18N.t('task_failed_plain'), 'err');
+        else if (res.count && res.count > 1) toast(I18N.t('task_created_n', { n: res.count }));
+        else toast(I18N.t('task_created', { id: res.job_id }));
+    }).catch((err) => toast(I18N.t('task_failed', { err: err }), 'err'));
 }
 
 /* ---------------- settings ---------------- */
@@ -826,7 +845,7 @@ function saveCookies() {
             if (v) map[el.getAttribute('data-source')] = v;
         });
         return api('setconfig', { per_source_cookies: map }).then((res) => {
-            if (!(res && res.ok)) { toast('保存失败：' + ((res && res.error) || '未知错误'), 'err'); return; }
+            if (!(res && res.ok)) { toast(I18N.t('save_failed', { err: (res && res.error) || I18N.t('unknown_error') }), 'err'); return; }
             const cfg = state.config || (state.config = {});
             cfg.per_source_cookies = res.config.per_source_cookies;
             // reflect the stored values back so the dialog shows what is really saved
@@ -834,17 +853,17 @@ function saveCookies() {
                 const src = el.getAttribute('data-source');
                 el.value = (cfg.per_source_cookies || {})[src] || '';
             });
-            toast('平台 Cookie 已保存', 'ok');
+            toast(I18N.t('cookie_saved'), 'ok');
             // countdown reminder, then auto-close the login dialog
             let left = 5;
-            toast('5 秒后自动关闭登录窗口', 'info');
+            toast(I18N.t('auto_close_in', { n: 5 }), 'info');
             const timer = setInterval(() => {
                 left -= 1;
                 if (left <= 0) { clearInterval(timer); closeLoginModal(); return; }
-                toast(`${left} 秒后自动关闭登录窗口`, 'info');
+                toast(I18N.t('auto_close_in', { n: left }), 'info');
             }, 1000);
         });
-    }).catch((err) => toast('保存失败：' + err, 'err'));
+    }).catch((err) => toast(I18N.t('save_failed', { err: err }), 'err'));
 }
 
 function closeLoginModal() { $('loginModal').hidden = true; }
@@ -871,12 +890,12 @@ function saveSettings() {
         if (res.ok) {
             state.config = res.config;
             $('workDirLabel').textContent = res.config.work_dir;
-            toast('设置已保存', 'ok');
+            toast(I18N.t('settings_saved'), 'ok');
             closeSettings();
         } else {
-            toast('保存失败：' + (res.error || ''), 'err');
+            toast(I18N.t('save_failed', { err: res.error || '' }), 'err');
         }
-    }).catch((err) => toast('保存失败：' + err, 'err'));
+    }).catch((err) => toast(I18N.t('save_failed', { err: err }), 'err'));
 }
 
 /* ---------------- bootstrap ---------------- */
@@ -902,6 +921,9 @@ function bindEvents() {
     $('clearJobsBtn').addEventListener('click', () => api('clearjobs').then(poll));
     $('openDirBtn').addEventListener('click', () => api('openpath', (state.config || {}).work_dir || ''));
     $('themeBtn').addEventListener('click', cycleTheme);
+    $('langBtn').addEventListener('click', openLangModal);
+    $('langZhBtn').addEventListener('click', () => chooseLang('zh-CN'));
+    $('langEnBtn').addEventListener('click', () => chooseLang('en-US'));
     $('settingsBtn').addEventListener('click', openSettings);
     $('loginBtn').addEventListener('click', openLoginModal);
     $('feedbackBtn').addEventListener('click', openFeedbackModal);
@@ -916,14 +938,14 @@ function bindEvents() {
     $('pickDirBtn').addEventListener('click', () => {
         api('pickfolder').then((res) => { if (res.ok && res.path) $('cfgWorkDir').value = res.path; });
     });
-    $('openConfigDirBtn').addEventListener('click', () => api('openconfigdir').then((r) => { if (!r.ok) toast(r.error || '打开配置目录失败', 'err'); }));
+    $('openConfigDirBtn').addEventListener('click', () => api('openconfigdir').then((r) => { if (!r.ok) toast(r.error || I18N.t('open_config_dir_failed'), 'err'); }));
     $('logsFab').addEventListener('click', () => setLogsOpen(true));
     $('toggleLogsBtn').addEventListener('click', () => setLogsOpen(false));
     $('clearLogsBtn').addEventListener('click', () => { $('logs').innerHTML = ''; });
     $('logFilterBtn').addEventListener('click', () => {
         state.logFilter = state.logFilter === 'all' ? 'warn' : 'all';
         $('logs').classList.toggle('hide-info', state.logFilter === 'warn');
-        $('logFilterBtn').textContent = state.logFilter === 'all' ? '精简' : '全部';
+        $('logFilterBtn').textContent = state.logFilter === 'all' ? I18N.t('logs_concise') : I18N.t('logs_all');
         felog(`log filter switched to ${state.logFilter}`, 'info', 'ui');
     });
     $('sourceGrid').addEventListener('change', (e) => {
@@ -975,8 +997,8 @@ function bindEvents() {
             if (it) it.status = 'downloading';
             renderJobs();
             api('retryaudio', jobId).then((r) => {
-                if (!r || !r.ok) toast(r && r.error ? r.error : '补音频启动失败', 'err');
-                else if (r.already) toast('该视频已包含音频，无需补录', 'ok');
+                if (!r || !r.ok) toast(r && r.error ? r.error : I18N.t('retry_audio_failed'), 'err');
+                else if (r.already) toast(I18N.t('already_has_audio'), 'ok');
             });
         } else if (btn.hasAttribute('data-cancel')) {
             job.status = 'cancelling';
@@ -984,9 +1006,9 @@ function bindEvents() {
             api('cancel', jobId);
         } else if (btn.hasAttribute('data-open')) {
             const saved = (job.items || []).find((it) => it.save_path);
-            const fallback = (r) => api('openpath', job.work_dir).then((r2) => { if (!r2.ok) toast('打开目录失败：' + (r2.error || r.error || ''), 'err'); });
+            const fallback = (r) => api('openpath', job.work_dir).then((r2) => { if (!r2.ok) toast(I18N.t('open_dir_failed', { err: r2.error || r.error || '' }), 'err'); });
             if (saved && saved.save_path) api('revealpath', saved.save_path).then((r) => { if (!r.ok) fallback(r); });
-            else api('openpath', job.work_dir).then((r) => { if (!r.ok) toast('打开目录失败：' + (r.error || ''), 'err'); });
+            else api('openpath', job.work_dir).then((r) => { if (!r.ok) toast(I18N.t('open_dir_failed', { err: r.error || '' }), 'err'); });
         }
     });
 }
@@ -997,6 +1019,10 @@ function init() {
     felog('event handlers bound', 'info', 'ui-boot');
     api('bootstrap').then((res) => {
         state.config = res.config;
+        window.__vdConfig = res.config;
+        // 后端没存过语言 = 首次打开 → 弹一次语言选择；老用户直接套用已存语言。
+        if (res.config.language && res.config.language !== I18N.current) { I18N.set(res.config.language); I18N.apply(); }
+        else if (!res.config.language) openLangModal();
         // if the source grid rendered before the config arrived, the checkbox
         // init was deferred — run it now that the whitelist is known
         if (state.pendingCheckedInit) initCheckedSources();
@@ -1012,7 +1038,6 @@ function init() {
         return api('checktools');
     }).then((tools) => {
         state.tools = tools || {};
-        renderToolChips();
         felog(`tools detected: ${Object.entries(state.tools).map(([k, v]) => `${k}=${v ? 'y' : 'n'}`).join(' ')}`, 'info', 'ui-boot');
     }).catch((err) => felog(`bootstrap/checktools failed: ${err}`, 'error', 'ui-boot'));
     const hash = decodeURIComponent((location.hash || '').replace(/^#/, ''));
@@ -1082,22 +1107,22 @@ function renderLoginGrid() {
     const grid = $('loginGrid');
     if (!grid) return;
     const all = state.platforms.concat(state.generic);
-    if (!all.length) { grid.innerHTML = '<div class="empty sm"><p>引擎加载后可用</p></div>'; return; }
+    if (!all.length) { grid.innerHTML = `<div class="empty sm"><p>${I18N.t('engine_loading_hint')}</p></div>`; return; }
     grid.innerHTML = all.map((name) => {
         const st = (state.logins && state.logins[name]) || 'absent';
         const logged = !!((state.config && state.config.per_source_cookies && state.config.per_source_cookies[name]));
         const err = (state.loginErrors && state.loginErrors[name]) || '';
         const supported = state.loginSupported == null ? true : state.loginSupported.includes(name);
         let action = '';
-        if (st === 'waiting') action = `<button class="btn ghost sm primary-mini" data-finish="${esc(name)}">完成提取</button>`;
-        else if (st === 'opening') action = '<span class="tag warn">打开中…</span>';
-        else if (st === 'extracting') action = '<span class="tag warn">提取中…</span>';
-        else if (st === 'incomplete') action = `<span class="tag bad">未完成</span><button class="btn ghost sm" data-login="${esc(name)}">重试</button>`;
-        else if (st === 'error') action = `<span class="tag bad">失败</span><button class="btn ghost sm" data-login="${esc(name)}">重试</button>`;
-        else if (logged) action = `<button class="btn ghost sm danger" data-logout="${esc(name)}">退出</button>`;
-        else if (supported) action = `<button class="btn ghost sm" data-login="${esc(name)}">登录</button>`;
-        else action = `<button class="btn ghost sm" data-cookie="${esc(name)}">填写 Cookie</button>`;
-        const badge = logged ? '<span class="tag good">已登录</span>' : (st === 'waiting' ? '<span class="tag warn">请登录</span>' : (st === 'incomplete' ? '<span class="tag bad">登录异常</span>' : ''));
+        if (st === 'waiting') action = `<button class="btn ghost sm primary-mini" data-finish="${esc(name)}">${I18N.t('login_finish_btn')}</button>`;
+        else if (st === 'opening') action = `<span class="tag warn">${I18N.t('login_opening')}</span>`;
+        else if (st === 'extracting') action = `<span class="tag warn">${I18N.t('login_extracting')}</span>`;
+        else if (st === 'incomplete') action = `<span class="tag bad">${I18N.t('login_incomplete')}</span><button class="btn ghost sm" data-login="${esc(name)}">${I18N.t('retry')}</button>`;
+        else if (st === 'error') action = `<span class="tag bad">${I18N.t('login_failed')}</span><button class="btn ghost sm" data-login="${esc(name)}">${I18N.t('retry')}</button>`;
+        else if (logged) action = `<button class="btn ghost sm danger" data-logout="${esc(name)}">${I18N.t('logout_btn')}</button>`;
+        else if (supported) action = `<button class="btn ghost sm" data-login="${esc(name)}">${I18N.t('login_btn')}</button>`;
+        else action = `<button class="btn ghost sm" data-cookie="${esc(name)}">${I18N.t('fill_cookie')}</button>`;
+        const badge = logged ? `<span class="tag good">${I18N.t('logged_in')}</span>` : (st === 'waiting' ? `<span class="tag warn">${I18N.t('please_login')}</span>` : (st === 'incomplete' ? `<span class="tag bad">${I18N.t('login_error')}</span>` : ''));
         const hint = (st === 'incomplete' || st === 'error') && err ? `<div class="login-hint" style="color:#d9534f;font-size:12px;margin-top:4px;white-space:normal;line-height:1.4;">${esc(err)}</div>` : '';
         return `<div class="login-item" data-source="${esc(name)}">
             <span class="login-name" title="${esc(name)}">${esc(shortname(name))}</span>
@@ -1159,24 +1184,24 @@ function startLogin(source) {
                 openCookieSettings(source);
                 return;
             }
-            toast((res && res.error) || '登录启动失败', 'err');
+            toast((res && res.error) || I18N.t('login_start_failed'), 'err');
             return;
         }
-        toast('请在弹出的浏览器窗口中登录，完成后点击「完成提取」');
+        toast(I18N.t('login_in_browser'));
         if (res.hint) toast(res.hint, 'warn');
         loadLogins();
-    }).catch((err) => toast('登录启动失败：' + err, 'err'));
+    }).catch((err) => toast(I18N.t('login_start_failed_with', { err: err }), 'err'));
 }
 function finishLogin(source) {
     api('login_finish', source).then((res) => {
-        if (!res || !res.ok) { toast((res && res.error) || '操作失败', 'err'); return; }
-        toast('已保存登录态');
+        if (!res || !res.ok) { toast((res && res.error) || I18N.t('operation_failed'), 'err'); return; }
+        toast(I18N.t('login_saved'));
         loadLogins();
-    }).catch((err) => toast('操作失败：' + err, 'err'));
+    }).catch((err) => toast(I18N.t('operation_failed_with', { err: err }), 'err'));
 }
 function logoutSource(source) {
-    api('logout', source).then(() => { toast('已退出登录'); loadLogins(); })
-        .catch((err) => toast('操作失败：' + err, 'err'));
+    api('logout', source).then(() => { toast(I18N.t('logged_out')); loadLogins(); })
+        .catch((err) => toast(I18N.t('operation_failed_with', { err: err }), 'err'));
 }
 
 function waitReady() {
