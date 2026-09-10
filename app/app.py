@@ -26,7 +26,7 @@ from backend import diag  # noqa: E402  (diagnostics must be importable as early
 import psutil  # noqa: E402  (used by the single-instance guard to reap a stuck previous instance)
 
 APP_NAME = '全能下载器'
-APP_VERSION = '1.1.2'
+APP_VERSION = '1.1.3'
 SELFTEST_URL = 'https://www.bilibili.com/video/BV1GJ411x7h7'
 
 
