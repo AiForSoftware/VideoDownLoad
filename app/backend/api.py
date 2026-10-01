@@ -11,6 +11,7 @@ from typing import Any, Dict, List
 
 from . import diag
 from .core import VideoDlService, defaultworkdir, HistoryStore, Config
+from .proxy import systemproxy, describe as describeproxy
 
 try:  # webview is only available when running the desktop shell
     import webview
@@ -50,6 +51,7 @@ class JsApi():
                 'num_threadings': self._service.config.num_threadings,
                 'concurrent_downloads': self._service.config.concurrent_downloads,
                 'proxy': self._service.config.proxy,
+                'use_system_proxy': getattr(self._service.config, 'use_system_proxy', True),
                 'cookies': self._service.config.cookies,
                 'per_source_cookies': self._service.config.per_source_cookies,
                 'default_quality': self._service.config.default_quality,
@@ -141,6 +143,8 @@ class JsApi():
                 pass
         if 'proxy' in config:
             cfg.proxy = str(config['proxy'] or '').strip()
+        if 'use_system_proxy' in config:
+            cfg.use_system_proxy = bool(config['use_system_proxy'])
         if 'cookies' in config:
             cfg.cookies = str(config['cookies'] or '').strip()
         if 'per_source_cookies' in config and isinstance(config['per_source_cookies'], dict):
@@ -164,6 +168,14 @@ class JsApi():
         threading.Thread(target=self._rebuild_client, name='rebuild-client', daemon=True).start()
         self._service.log('info', 'settings saved')
         return {'ok': True, 'config': self.bootstrap()['config']}
+
+    def systemproxyinfo(self) -> Dict[str, Any]:
+        '''给设置面板用：当前系统代理探测结果（含 PAC 解析结果）。'''
+        try:
+            proxies = systemproxy()
+        except Exception as err:
+            return {'ok': False, 'error': str(err), 'proxies': {}, 'text': ''}
+        return {'ok': True, 'proxies': proxies, 'text': describeproxy(proxies)}
 
     def _rebuild_client(self) -> None:
         try:

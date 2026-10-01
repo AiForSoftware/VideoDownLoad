@@ -1,28 +1,28 @@
 # 全能下载器 · VideoDownLoad
 
-Windows 桌面视频下载器：把命令行视频下载引擎 `vd` 封装成带 GUI 的桌面应用
-（pywebview + Edge WebView2），支持**抖音 / B站 / YouTube / 腾讯视频** 的解析、选档、并发下载、
+Windows 桌面视频下载器：把命令行视频下载引擎 `vd` 封装成带 GUI 的桌面应用  
+（pywebview + Edge WebView2），支持**抖音 / B站 / YouTube / 腾讯视频** 的解析、选档、并发下载、  
 任务级暂停恢复，以及**字幕自动下载并封装进视频**。界面支持**中英文切换**（默认中文，首次打开会提示选择语言）。
 
----
+* * *
 
 ## 🤖 AI 生成声明
 
 > **本项目由 AI 生成。**
->
-> 代码、文档与构建脚本的主体由 AI（CodeBuddy）在人类指导下自动生成与迭代，
+> 
+> 代码、文档与构建脚本的主体由 AI（CodeBuddy）在人类指导下自动生成与迭代，  
 > 人类负责提出需求、验证效果与验收。
->
+> 
 > 因此：代码中可能存在非典型写法或冗余的防御性逻辑，多为针对特定历史事故的处理，里面每一条都对应一次真实返工。
->
+> 
 > `docs/` 目录为本地工作文档（AI 接手指南 / 解析器攻关档案），**不纳入版本库**，仅供本机参考。
 
----
+* * *
 
 ## ✨ 主要特性
 
 | 特性 | 说明 |
-|---|---|
+| --- | --- |
 | 多平台解析 | 抖音、B站、YouTube、腾讯视频（`v.qq.com`）解析器；另有 `WebMediaGrabber` 网页媒体抓取兜底 |
 | 画质选档 | 4K / 1080P+ / 1080P / 720P / 480P … 按档位枚举成独立条目，前端分组可选 |
 | 下载编排 | 多条目并发下载（可设"同时下载数"），任务级**暂停 / 恢复 / 取消** |
@@ -35,7 +35,7 @@ Windows 桌面视频下载器：把命令行视频下载引擎 `vd` 封装成带
 | 多语言 | 中英文，默认中文。语言存 `config.language` + `localStorage['vd_lang']`；首次打开（`language` 为空）自动弹一次语言选择（高亮当前语言），之后点顶栏地球图标可随时切换 |
 | 解析失败引导 | 任何平台只要一条有效链接都没解析到，统一提示「请先登录该平台后重试」（顶部弹窗停留 5 秒）；原始错误收进提示悬停，结果卡片不再直接铺长串错误 |
 
----
+* * *
 
 ## 🏗 项目架构
 
@@ -66,6 +66,12 @@ Windows 桌面视频下载器：把命令行视频下载引擎 `vd` 封装成带
 │  外部工具      ffmpeg / ffprobe（系统 PATH）、N_m3u8DL-RE、     │
 │                aria2c（随包 bin/）、node（可选，系统 PATH）      │
 └──────────────────────────────────────────────────────────────┘
+
+
+
+
+
+
 ```
 
 ### 进程模型
@@ -76,11 +82,17 @@ VideoDLDesktop.exe                     ← supervisor 监控进程（持有单�
    └── VideoDLDesktop.exe --child      ← UI 子进程
          隐藏启动 → 页面 loaded 写入标记文件 → 原生 ShowWindow 显示
          supervisor 超时未见到标记 → psutil 杀整棵子树 → 重试（最多 5 次）
+
+
+
+
+
+
 ```
 
-- 前 2 次尝试给 60s（冷启动 + Defender 扫描），后续 30s；
-- 存活探针需**连续两次**判定无忙碌 WebView2 进程才重试，避免误杀冷启动；
-- 关窗口时 `_hard_exit()` 递归杀掉整棵进程树，保证"关窗口 = 进程消失"。
+-   前 2 次尝试给 60s（冷启动 + Defender 扫描），后续 30s；
+-   存活探针需**连续两次**判定无忙碌 WebView2 进程才重试，避免误杀冷启动；
+-   关窗口时 `_hard_exit()` 递归杀掉整棵进程树，保证"关窗口 = 进程消失"。
 
 ### 数据流（一次下载）
 
@@ -96,6 +108,12 @@ VideoDLDesktop.exe                     ← supervisor 监控进程（持有单�
   → 视频 + 音频分别下载 → ffmpeg 合并（copy / transcode 两次尝试）
   → 字幕：下载 → 必要时转换（B站 JSON→VTT）→ ffmpeg 内封
   → 成品落 work_dir，任务状态 done；未完成任务持久化到 jobs.json，下次启动可"继续"
+
+
+
+
+
+
 ```
 
 ### 目录结构
@@ -129,19 +147,25 @@ VideoDownLoad/
 ├── version.txt                 # ★ 版本号唯一真源（每次打包 +1 patch）
 ├── requirements.txt            # 引擎 + 桌面壳合并依赖
 └── dist/VideoDLDesktop/        # 打包产物（onedir，唯一发布位置）
+
+
+
+
+
+
 ```
 
----
+* * *
 
 ## 🚀 快速开始
 
 ### 环境要求
 
-- Windows 10 / 11（x64）
-- Python 3.11
-- Microsoft Edge WebView2 Runtime
-- **ffmpeg / ffprobe**（合并音视频必需，需在系统 PATH）
-- N_m3u8DL-RE、aria2c 已随包捆绑，无需单独安装
+-   Windows 10 / 11（x64）
+-   Python 3.11
+-   Microsoft Edge WebView2 Runtime
+-   **ffmpeg / ffprobe**（合并音视频必需，需在系统 PATH）
+-   N\_m3u8DL-RE、aria2c 已随包捆绑，无需单独安装
 
 ### 从源码运行
 
@@ -150,34 +174,189 @@ cd D:\CodeBuddy\VideoDownLoad
 pip install -r requirements.txt      # ★ 务必装上 yt-dlp，缺失会让音频合并静默失效
 $env:PYTHONIOENCODING = "utf-8"
 python app\app.py
+
+
+
+
+
+
 ```
 
 ### 打包
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File build_now.ps1
+
+
+
+
+
+
 ```
 
-流程：① 自动递增版本号 → ② 关运行实例 → ③ 预删 `dist`/`build` → ④ PyInstaller 构建
+流程：① 自动递增版本号 → ② 关运行实例 → ③ 预删 `dist`/`build` → ④ PyInstaller 构建  
 → ⑤ 打印日志关键行 → ⑥ 产物检查。产物落在 `dist/VideoDLDesktop/`。
 
-> **不要绕过脚本直接 `python -m PyInstaller build.spec`**——那样版本号不递增，
+> **不要绕过脚本直接 `python -m PyInstaller build.spec`**——那样版本号不递增，  
 > 激活上报会把新包当成同一版本。
 
 ### 无头自检
 
 ```powershell
 dist\VideoDLDesktop\VideoDLDesktop.exe --selftest
+
+
+
+
+
+
 ```
 
----
+* * *
+
+## 🔌 MCP Server（AI 客户端接入）
+
+本项目内置标准 **MCP（Model Context Protocol）stdio server**，可以把下载能力直接挂给  
+Claude Desktop / CodeBuddy 等任何支持 MCP 的 AI 客户端，让 AI 替你解析和下载视频。
+
+### 服务端启动
+
+**前置条件**：Python 3.11 + `pip install -r requirements.txt`（`mcp` 已包含在「桌面壳依赖」段）。
+
+**方式一：MCP 客户端自动拉起（推荐，正常用法）**
+
+在客户端配置好 `mcpServers`（见下方配置示例）即可——客户端会在会话开始时自动启动  
+server、会话结束时自动关闭，**无需也不建议手动常驻运行**。
+
+**方式二：命令行手动启动（调试用）**
+
+```powershell
+.venv\Scripts\python.exe app\app.py --mcp
+
+
+
+
+
+
+```
+
+-   启动后**没有输出、像"卡住"是正常的**：stdio 模式下 server 在等 MCP 客户端从 stdin  
+    发来 JSON-RPC 请求，不是死循环；
+-   停止：`Ctrl+C`，或对端关闭 stdin 后进程自动退出。
+
+**方式三：打包 exe 启动**
+
+```powershell
+dist\VideoDLDesktop\VideoDLDesktop.exe --mcp
+
+
+
+
+
+
+```
+
+> 需用 `build_now.ps1` 重新打包（`build.spec` 已收集 `mcp` 依赖）；MCP 客户端以管道  
+> 方式拉起时 stdio 可用。
+
+**验证 server 是否正常**（发一条 initialize 请求，输出一行 JSON 响应即正常）：
+
+```powershell
+'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"manual","version":"0"}}}' | .venv\Scripts\python.exe app\app.py --mcp
+
+
+
+
+
+
+```
+
+**图形化调试（可选）**：官方 MCP Inspector 可视化调用全部 14 个工具：
+
+```powershell
+npx @modelcontextprotocol/inspector .venv\Scripts\python.exe app\app.py --mcp
+
+
+
+
+
+
+```
+
+### 运行特性
+
+-   无界面、无单实例锁、无监控进程，headless 复用 `VideoDlService`；
+-   引擎在启动时后台预热，首次 `parse_url` 不再等 ~10s 冷启动；
+-   stdin/stdout 只跑 JSON-RPC，引擎与子进程的全部杂散输出重定向到 stderr，协议流不会被污染；
+-   配置与历史与桌面 App 共享（`config.json` / `jobs.json`）。
+
+### 客户端配置示例
+
+```json
+{
+  "mcpServers": {
+    "vd-downloader": {
+      "command": "python",
+      "args": ["D:\\CodeBuddy\\VideoDownLoad\\app\\app.py", "--mcp"],
+      "env": { "PYTHONIOENCODING": "utf-8" }
+    }
+  }
+}
+
+
+
+
+
+
+```
+
+### 工具清单（14 个）
+
+| 类别 | 工具 | 说明 |
+| --- | --- | --- |
+| 发现 | `list_sources` | 平台/解析器列表 + 引擎状态 + ffmpeg/node 等工具可用性诊断 |
+| 解析 | `parse_url` | 解析单链接 → 画质条目（每个带唯一 `key`） |
+| 解析 | `parse_urls` | 批量解析，逐 URL 错误不中断整批 |
+| 下载 | `download` | 按 `key` 提交下载 → 返回 `job_id` |
+| 下载 | `get_download_state` | 纯快照：立即返回任务/进度，由调用方轮询直至终态 |
+| 下载 | `pause_job` / `resume_job` / `cancel_job` / `retry_audio` / `clear_jobs` | 任务控制 |
+| 配置 | `get_config` / `set_config` | 读写 work\_dir、并发数、代理、Cookie、默认画质等 |
+| 历史 | `get_history` / `clear_history` | 解析历史 |
+
+### AI 典型调用流
+
+```
+parse_url("https://www.bilibili.com/video/BVxxx")
+  → items（含 4K/1080P/720P 各档 key）
+download(keys=["..."])
+  → { job_id }
+get_download_state(job_id)   ← 每 3~5s 轮询，直到条目全部 done/error
+  → { save_path: "C:\\Users\\..\\vd_downloads\\xxx.mp4" }
+
+
+
+
+
+
+```
+
+### 已知边界
+
+-   `login`（平台登录）需要 GUI 弹窗，不在 MCP 工具内：请先在桌面 App 里完成登录，  
+    MCP server 会共享 `per_source_cookies` 登录态；
+-   MCP server 与桌面 App 并存时共享同一份配置/任务存储，建议不要同时修改配置  
+    （任务列表读取已有容错合并，配置写入暂无进程锁）；
+-   `get_download_state` 是纯快照模式，AI 客户端需自行按间隔轮询至终态  
+    （done / error / cancelled / paused）。
+
+* * *
 
 ## ⚙️ 配置
 
 配置文件：`C:\Users\<你>\AppData\Local\vd\vd-desktop\config.json`
 
 | 字段 | 说明 |
-|---|---|
+| --- | --- |
 | `work_dir` | 下载输出目录 |
 | `concurrent_downloads` | 同时下载数（线程池上限） |
 | `default_quality` | `best` / `4k` / `1080p` / `720p` / `480p` / `360p` / `auto` |
@@ -188,21 +367,22 @@ dist\VideoDLDesktop\VideoDLDesktop.exe --selftest
 | `language` | 界面语言：`zh-CN` / `en-US`；空 = 尚未选择，首次打开会弹语言选择 |
 
 同目录下还有诊断日志，排查启动/卡死问题第一现场：
-- `Logs\startup.log`（进程级事件，每行带耗时/内存/线程）
-- `Logs\desktop.log`（引擎内部日志）
 
----
+-   `Logs\startup.log`（进程级事件，每行带耗时/内存/线程）
+-   `Logs\desktop.log`（引擎内部日志）
+
+* * *
 
 ## ⚠️ 已知边界
 
-- **HTTP 断点续传未实现**：暂停后恢复是把该条目重新提交，引擎从头下载（非 Range 续传）。
-- ffmpeg / ffprobe / node 依赖系统 PATH，缺失会导致合并或解密类解析器不可用。
-- YouTube 存在**出口 IP 临时降权**（小时~天级自动恢复），期间所有工具（含 yt-dlp、
-  YoutubeDownloader）会同时失效，属网络时变状态，不是代码缺陷。
-- 引擎解析内部异常只能引导用户重新解析（根因在引擎对源站数据结构的假设）。
-- **腾讯视频**：支持 `v.qq.com/x/cover/...` 与 `/x/page/...`；清晰度按接口返回的 `fl.fi` 真实档位枚举（实测常见 480P / 720P，随片源而定，不必强求 1080P）。仅支持单段片源，多段片源（`fn` 形如 `a.p201.1.mp4`）未做分段拼接，取不到完整地址时回落到 `WebMediaGrabber` 抓取。
+-   **HTTP 断点续传未实现**：暂停后恢复是把该条目重新提交，引擎从头下载（非 Range 续传）。
+-   ffmpeg / ffprobe / node 依赖系统 PATH，缺失会导致合并或解密类解析器不可用。
+-   YouTube 存在**出口 IP 临时降权**（小时~天级自动恢复），期间所有工具（含 yt-dlp、  
+    YoutubeDownloader）会同时失效，属网络时变状态，不是代码缺陷。
+-   引擎解析内部异常只能引导用户重新解析（根因在引擎对源站数据结构的假设）。
+-   **腾讯视频**：支持 `v.qq.com/x/cover/...` 与 `/x/page/...`；清晰度按接口返回的 `fl.fi` 真实档位枚举（实测常见 480P / 720P，随片源而定，不必强求 1080P）。仅支持单段片源，多段片源（`fn` 形如 `a.p201.1.mp4`）未做分段拼接，取不到完整地址时回落到 `WebMediaGrabber` 抓取。
 
----
+* * *
 
 ## 📄 开源协议
 
@@ -230,14 +410,20 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+
+
+
+
+
 ```
 
-- 使用的第三方依赖（pywebview、DrissionPage、yt-dlp、requests、curl_cffi、rich、
-  PyInstaller 等）各自遵循其原始协议。
+-   使用的第三方依赖（pywebview、DrissionPage、yt-dlp、requests、curl\_cffi、rich、  
+    PyInstaller 等）各自遵循其原始协议。
 
----
+* * *
 
 ## 🙏 致谢与免责
 
-- 本项目仅供**学习与技术研究**使用。请遵守各视频平台的服务条款与所在地区的法律法规，
-  尊重内容创作者的版权，勿将下载内容用于商业或侵权用途。
+-   本项目仅供**学习与技术研究**使用。请遵守各视频平台的服务条款与所在地区的法律法规，  
+    尊重内容创作者的版权，勿将下载内容用于商业或侵权用途。

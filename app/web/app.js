@@ -811,10 +811,26 @@ function openSettings() {
     $('cfgThreads').value = cfg.num_threadings || 5;
     $('cfgConcurrent').value = cfg.concurrent_downloads || 2;
     $('cfgProxy').value = cfg.proxy || '';
+    $('cfgSysProxy').checked = cfg.use_system_proxy !== false;
     $('cfgQuality').value = (cfg.default_quality || 'best');
     $('cfgSubtitles').checked = !!(cfg.download_subtitles);
     loadSources();
+    refreshSysProxyHint();
     $('settingsModal').hidden = false;
+}
+
+// 把"系统代理探测结果"显示出来：用户常常不知道自己的系统走的是 PAC 脚本，
+// 而 PAC 在设置里看不到地址，只有探测能说清楚实际用到了什么。
+function refreshSysProxyHint() {
+    const hint = $('sysProxyHint');
+    hint.hidden = true;
+    api('systemproxyinfo').then((res) => {
+        if (!res || !res.ok) return;
+        hint.textContent = res.proxies && Object.keys(res.proxies).length
+            ? I18N.t('sys_proxy_detected', { text: res.text })
+            : I18N.t('sys_proxy_none');
+        hint.hidden = false;
+    }).catch(() => {});
 }
 
 function closeSettings() { $('settingsModal').hidden = true; }
@@ -879,6 +895,7 @@ function saveSettings() {
         num_threadings: parseInt($('cfgThreads').value, 10) || 5,
         concurrent_downloads: parseInt($('cfgConcurrent').value, 10) || 2,
         proxy: $('cfgProxy').value.trim(),
+        use_system_proxy: $('cfgSysProxy').checked,
         default_quality: $('cfgQuality').value,
         download_subtitles: $('cfgSubtitles').checked,
         // persist exactly what the user checked. The old "(all checked) -> []"

@@ -302,12 +302,16 @@ class NM3U8DLRECommandFactory:
 class DownloadWithNM3U8DLRECommand(NM3U8DLRECommandFactory):
     DISABLE_CHECK_SEGMENTS_COUNT_SOURCES = {"XMFlvVideoClient", "IM1907VideoClient", "VgetVideoClient", "JisuYunVideoClient"}
     '''build'''
-    def build(self, video_info: VideoInfo, default_headers: Optional[Mapping[str, Any]] = None, request_overrides: Optional[Mapping[str, Any]] = None, mods: Optional[ModType] = None, log_file_path: Optional[str] = None) -> list[str]:
+    def build(self, video_info: VideoInfo, default_headers: Optional[Mapping[str, Any]] = None, request_overrides: Optional[Mapping[str, Any]] = None, mods: Optional[ModType] = None, log_file_path: Optional[str] = None, tmp_dir: Optional[str] = None) -> list[str]:
         request_overrides, default_headers, download_url, output_file = request_overrides or {}, default_headers or {}, video_info.download_url, video_info.save_path
         save_dir, save_name, ext = os.path.dirname(output_file) or ".", os.path.splitext(os.path.basename(output_file))[0], video_info.ext
         builder = (self.newbuilder().positional(download_url).flag("--auto-select").opt("--save-dir", save_dir).opt("--save-name", save_name).opt("--thread-count", '8').opt("--download-retry-count", '3'))
         builder.opt("--check-segments-count", "false") if video_info.source in DownloadWithNM3U8DLRECommand.DISABLE_CHECK_SEGMENTS_COUNT_SOURCES else builder.flag("--check-segments-count")
         builder.flag("--del-after-done").opt("-M", f"format={ext}").opt("--log-file-path", log_file_path)
+        # 断点续传：给一个**稳定**的临时目录（默认 ./temp 每次都换，已下好的分片永远
+        # 利用不上）。v0.6.0-beta 没有 --continue，但固定 tmp-dir 后重跑能复用已落盘的
+        # 分片；--del-after-done 会在成功后清空它。
+        if tmp_dir: builder.opt("--tmp-dir", tmp_dir)
         for k, v in default_headers.items(): builder.opt("-H", f"{k}: {v}")
         proxies = request_overrides.get("proxies", {}) if isinstance(request_overrides, Mapping) else {}
         if (proxy_url := next(iter((proxies or {}).values()), None)): builder.opt("--custom-proxy", proxy_url)

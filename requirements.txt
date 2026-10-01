@@ -32,6 +32,7 @@ puremagic>=1.30,<2; python_version < "3.12"
 
 # ===== desktop shell (桌面壳依赖) =====
 pywebview>=5.4,<7
+mcp>=1.0.0,<2
 pyinstaller>=6.3,<7
 psutil>=5.9
 websocket-client>=1.6

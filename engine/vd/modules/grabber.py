@@ -131,7 +131,13 @@ class WebMediaGrabber(BaseVideoClient):
         # get test
         try:
             (range_headers := dict(headers))["Range"] = "bytes=0-1023"
-            (resp := self.get(url, headers=range_headers, cookies=cookies, allow_redirects=True, stream=True, **other_kwargs)).raise_for_status()
+            resp = self.get(url, headers=range_headers, cookies=cookies, allow_redirects=True, stream=True, **other_kwargs)
+            # self.get 在重试全灭时返回 None（异常已在内部记日志），直接
+            # .raise_for_status() 会抛 AttributeError——它不是
+            # requests.RequestException，下面的 except 接不住，会一路冒泡到 UI
+            # 变成 "'NoneType' object has no attribute 'raise_for_status'"。
+            if resp is None: raise requests.RequestException(f'request failed without a response: {url}')
+            resp.raise_for_status()
             ct = self.normalizecontenttype(resp.headers.get("Content-Type")); resp.close()
             if ct and (ct.startswith(self.LIKELY_MEDIA_CT_PREFIX) or ct in self.LIKELY_PLAYLIST_CT): result = (True, ct); self._direct_media_cache[url] = result; return result
         except requests.RequestException:

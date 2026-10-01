@@ -94,7 +94,9 @@ NOTE: we deliberately strip the eager `from .xxx import XxxVideoClient` lines
 out of `vd.modules.sources/__init__.py` and `vd.modules.common/__init__.py`
 to enable lazy parser loading. This means PyInstaller cannot discover the parser
 sub-modules via `collect_submodules`, so we have to list them by hand here.'''
-hiddenimports = ['backend.api', 'backend.core', 'backend.progress', 'backend.tracker']
+hiddenimports = ['backend.api', 'backend.core', 'backend.progress', 'backend.tracker',
+                 'backend.mcp_server']  # MCP stdio server (--mcp), imported lazily in main()
+hiddenimports += collect_submodules('mcp')  # MCP protocol SDK (fastmcp / stdio transport)
 hiddenimports += collect_submodules('vd')
 hiddenimports += collect_submodules('webview')
 hiddenimports += collect_submodules('DrissionPage')

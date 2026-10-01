@@ -143,6 +143,11 @@
                 <span data-i18n="proxy">代理（可选，例如 127.0.0.1:7890）</span>
                 <input id="cfgProxy" type="text" spellcheck="false" data-i18n-ph="proxy_ph" placeholder="留空则不使用代理" />
             </label>
+            <label class="field checkbox">
+                <input id="cfgSysProxy" type="checkbox" />
+                <span data-i18n="sys_proxy">手动代理留空时，跟随系统代理（含自动配置脚本 PAC）</span>
+            </label>
+            <div class="hint" id="sysProxyHint" hidden></div>
             <label class="field">
                 <span data-i18n="quality">默认画质（解析后默认选中的清晰度）</span>
                 <select id="cfgQuality">

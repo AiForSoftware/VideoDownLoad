@@ -1,5 +1,7 @@
 ﻿$ErrorActionPreference = 'Continue'
-$root = 'D:\CodeBuddy\VideoDownLoad'
+# 用脚本自身所在目录作项目根（旧值是硬编码的 D:\CodeBuddy\VideoDownLoad，
+# 项目迁移后 Set-Location 会失败）
+$root = $PSScriptRoot
 Set-Location $root
 
 Write-Host "[1/7] 自动递增版本号 (version.txt -> app/app.py)..."

@@ -13,9 +13,14 @@ msvcrt = __import__("msvcrt") if os.name == "nt" else None
 
 
 '''safeunlinkpathobj'''
-def safeunlinkpathobj(path: Path, max_retries=20, delay=0.1):
+def safeunlinkpathobj(path, max_retries=20, delay=0.1):
+    # 调用方既传 Path 也传 str（generateuniquetmppath 返回的是 str）。
+    # 以前只按 Path 用，str 进来会在 path.unlink() 抛 AttributeError 被
+    # except 吞掉、重试 20 次后返回 False —— 结果临时文件（字幕 .vtt、
+    # 合并中间文件）从来没被删掉，全留在用户下载目录里。
+    p = pathlib.Path(path)
     for _ in range(max_retries):
-        try: path.unlink(missing_ok=True); return True
+        try: p.unlink(missing_ok=True); return True
         except Exception: time.sleep(delay)
     return False
 

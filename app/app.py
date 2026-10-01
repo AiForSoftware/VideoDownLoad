@@ -26,7 +26,7 @@ from backend import diag  # noqa: E402  (diagnostics must be importable as early
 import psutil  # noqa: E402  (used by the single-instance guard to reap a stuck previous instance)
 
 APP_NAME = '全能下载器'
-APP_VERSION = '1.1.3'
+APP_VERSION = '1.1.9'
 SELFTEST_URL = 'https://www.bilibili.com/video/BV1GJ411x7h7'
 
 
@@ -1040,6 +1040,8 @@ def main() -> int:
                         help='run a headless parse+download self test and write a json report to the user home dir')
     parser.add_argument('--child', action='store_true', dest='child',
                         help=argparse.SUPPRESS)  # internal: run the UI as a supervised child
+    parser.add_argument('--mcp', action='store_true', dest='mcp',
+                        help='run as a Model Context Protocol (MCP) stdio server (no GUI)')
     parser.add_argument('--report-uninstall', action='store_true', dest='report_uninstall',
                         help=argparse.SUPPRESS)  # 卸载程序调用：同步上报一次 uninstall
     args = parser.parse_args()
@@ -1052,6 +1054,13 @@ def main() -> int:
     if args.selftest:
         diag.log('app', f'selftest requested: {args.selftest}')
         return runselftest(args.selftest)
+
+    if args.mcp:
+        # MCP stdio server: headless reuse of VideoDlService, no GUI, no
+        # single-instance lock, no supervisor. Runs until the client closes stdin.
+        diag.log('app', 'mcp stdio server requested')
+        from backend.mcp_server import run as runmcpserver
+        return runmcpserver()
 
     if args.child:
         return run_ui(args)

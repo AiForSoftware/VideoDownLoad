@@ -15,6 +15,7 @@ import re
 import sys
 import json
 import shutil
+import socket
 import logging
 import threading
 import traceback
@@ -30,6 +31,7 @@ from typing import Any, Dict, List, Optional, Set
 from urllib.parse import urlsplit
 
 from . import diag
+from .proxy import systemproxy, describe as describeproxy
 from .progress import ProgressBus, install_progress_hook, DownloadCancelled, DownloadPaused
 
 # Enable the lazy-parser mode we wired into the vendored vd upstream.
@@ -159,6 +161,10 @@ class Config():
     num_threadings: int = 5
     concurrent_downloads: int = 1
     proxy: str = ''
+    # 手动代理留空时，是否跟随系统代理（Windows 的 IE/WinHTTP 设置，含
+    # "自动配置脚本" PAC —— 见 backend/proxy.py）。默认开启：很多用户的
+    # 出口就在系统代理里，不跟随的话 YouTube 等站点会全部解析失败。
+    use_system_proxy: bool = True
     cookies: str = ''
     # per-source login cookies captured via the in-app login window (DrissionPage).
     # keyed by the vd source class name, e.g. 'BilibiliVideoClient'.
@@ -546,6 +552,8 @@ class VideoDlService():
             return '下载失败：被源站风控拦截(412)，请稍后重试，或点击顶栏「登录态」按钮登录该平台。'
         if '404' in last:
             return '下载失败：资源不存在(404)，视频可能已被删除或链接无效。'
+        if 'unable to connect to proxy' in m or 'proxyerror' in m or '10061' in last or 'tunnel connection failed' in m:
+            return '下载失败：代理无法连接，请在「设置」中检查代理地址（当前代理未响应），或留空后使用直连重试。'
         if 'timed out' in m or 'timeout' in m:
             return '下载失败：网络超时，请检查网络或代理设置。'
         if 'ffmpeg' in m:
@@ -556,15 +564,89 @@ class VideoDlService():
             return '下载失败：写入被拒绝，请检查保存目录的写入权限。'
         return '下载失败：' + last[:200]
 
-    def _buildrequests_overrides(self) -> Dict[str, Dict[str, Any]]:
-        overrides: Dict[str, Any] = {}
+    # 代理连通性探测结果的缓存时间（秒）——代理是用户长期配置，没必要每次解析都探。
+    _PROXY_PROBE_TTL = 60.0
+    _proxy_probe_cache: Dict[str, tuple] = {}
+
+    @classmethod
+    def _proxyreachable(cls, proxy: str) -> bool:
+        '''TCP 连通性预检（带缓存）。代理端口不通时若照旧把请求丢给它，
+        每个 HTTP 调用都会 ProxyError，表现为"所有平台同时解析不了"，
+        而真实原因与解析代码无关。探不通就回退直连并给出告警。'''
+        now = time.time()
+        cached = cls._proxy_probe_cache.get(proxy)
+        if cached and (now - cached[1]) < cls._PROXY_PROBE_TTL:
+            return cached[0]
+        ok = False
+        try:
+            parts = urlsplit(proxy if '://' in proxy else f'http://{proxy}')
+            host = parts.hostname or ''
+            port = parts.port or (443 if parts.scheme == 'https' else 80)
+            if host:
+                with socket.create_connection((host, port), timeout=2.0):
+                    ok = True
+        except Exception:
+            ok = False
+        cls._proxy_probe_cache[proxy] = (ok, now)
+        return ok
+
+    def _resolve_proxies(self) -> Dict[str, str]:
+        '''决定本次请求用哪套代理：手动代理 > 系统代理（含 PAC） > 直连。
+        两种代理都会先做 TCP 连通性预检，不通就直连（见 _proxyreachable）。'''
         if self.config.proxy.strip():
             proxy = self.config.proxy.strip()
             if '://' not in proxy:
                 proxy = 'http://' + proxy
-            proxies = {'http': proxy, 'https': proxy}
-        else:
-            proxies = {}
+            if self._proxyreachable(proxy):
+                return {'http': proxy, 'https': proxy}
+            # 手动代理不通时不要直接退回直连——系统里可能还有一条能出网的
+            # 系统代理（PAC），先交给下面的分支试；都不通才直连。
+            self.log('warning', f'代理 {proxy} 无法连接，改由系统代理/直连接管（请在「设置」中修正代理地址或留空）')
+        if getattr(self.config, 'use_system_proxy', True):
+            proxies = systemproxy()
+            if not proxies:
+                return {}
+            # 逐项校验：PAC 可能给出多个代理地址，只要有一个通的就用它
+            reachable = {k: v for k, v in proxies.items() if self._proxyreachable(v)}
+            if not reachable:
+                self.log('warning', f'系统代理 {describeproxy(proxies)} 无法连接，本次已回退直连')
+                return {}
+            self._notifysystemproxy(reachable)
+            return reachable
+        return {}
+
+    def _applyurlproxy(self, client, url: str) -> None:
+        '''按目标 URL 重新解析系统代理并写进该 client 的 requests_overrides。'''
+        if client is None or self.config.proxy.strip() or not getattr(self.config, 'use_system_proxy', True):
+            return
+        try:
+            proxies = systemproxy(url)
+        except Exception:
+            return
+        if not proxies:
+            return
+        reachable = {k: v for k, v in proxies.items() if self._proxyreachable(v)}
+        if not reachable:
+            return
+        self._notifysystemproxy(reachable)
+        overrides = getattr(client, 'requests_overrides', None)
+        if not isinstance(overrides, dict):
+            return
+        for per in overrides.values():
+            if isinstance(per, dict):
+                per['proxies'] = dict(reachable)
+
+    def _notifysystemproxy(self, proxies: Dict[str, str]) -> None:
+        '''系统代理只在"值变化"时打一条日志，避免每次解析刷屏。'''
+        text = describeproxy(proxies)
+        if getattr(self, '_last_system_proxy_text', None) == text:
+            return
+        self._last_system_proxy_text = text
+        self.log('info', f'使用系统代理：{text}')
+
+    def _buildrequests_overrides(self) -> Dict[str, Dict[str, Any]]:
+        overrides: Dict[str, Any] = {}
+        proxies = self._resolve_proxies()
         # global cookies as the fallback baseline for every source
         base_cookies = self._parsecookies(self.config.cookies)
         # per-source login cookies captured via the in-app login window
@@ -623,7 +705,8 @@ class VideoDlService():
         # cookies. Serialize the contents instead so any change is detected and
         # forces a rebuild with the new cookies.
         cookies_sig = tuple(sorted((str(k), str(v)) for k, v in (self.config.per_source_cookies or {}).items()))
-        signature = (self.config.work_dir, self.config.num_threadings, self.config.proxy, self.config.cookies, cookies_sig, self.config.apply_common_clients_only, tuple(sorted(allowed)))
+        signature = (self.config.work_dir, self.config.num_threadings, self.config.proxy, self.config.cookies, cookies_sig,
+                     self.config.apply_common_clients_only, getattr(self.config, 'use_system_proxy', True), tuple(sorted(allowed)))
         with self._client_lock:
             if self._client is not None and self._client_signature == signature and not force:
                 return self._client
@@ -798,6 +881,9 @@ class VideoDlService():
         # `allowed` keeps the running client minimal — it won't accumulate
         # every parser that has ever been touched across the session.
         client = self._buildclient(allowed=matched or None)
+        # 系统代理（PAC）是按目标地址解析的：这里按当前 URL 再取一次，覆盖
+        # 构建客户端时用的通用结果（PAC 对不同域名可能返回不同出口）。
+        self._applyurlproxy(client, url)
         self.config.last_url = url
         self.config.save()
         self.log('info', f'parsing url: {url}')

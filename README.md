@@ -181,6 +181,99 @@ dist\VideoDLDesktop\VideoDLDesktop.exe --selftest
 
 ---
 
+## 🔌 MCP Server (AI client integration)
+
+The project ships a standard **MCP (Model Context Protocol) stdio server**, so any
+MCP-capable AI client (Claude Desktop, CodeBuddy, ...) can drive the downloader.
+
+### Starting the server
+
+**Prerequisite**: Python 3.11 + `pip install -r requirements.txt` (`mcp` is listed in the desktop-shell section).
+
+**Option 1 — launched by the MCP client (recommended, the normal usage)**
+
+Just configure `mcpServers` in your client (see the example below) — the client
+starts the server when the session begins and shuts it down afterwards.
+**There is no need, and it is discouraged, to run it manually in the background.**
+
+**Option 2 — manual start from the command line (debugging)**
+
+```powershell
+.venv\Scripts\python.exe app\app.py --mcp
+```
+
+- **No output / looking "stuck" is normal**: in stdio mode the server waits for
+  the MCP client to send JSON-RPC requests on stdin;
+- Stop with `Ctrl+C`, or the process exits automatically when the peer closes stdin.
+
+**Option 3 — packaged exe**
+
+```powershell
+dist\VideoDLDesktop\VideoDLDesktop.exe --mcp
+```
+
+> Rebuild with `build_now.ps1` first (`build.spec` already collects the `mcp`
+> dependency); stdio works when the client spawns the exe with pipes.
+
+**Verify the server works** (send an `initialize` request; one JSON line back means OK):
+
+```powershell
+'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"manual","version":"0"}}}' | .venv\Scripts\python.exe app\app.py --mcp
+```
+
+**Visual debugging (optional)**: the official MCP Inspector lets you call all
+14 tools interactively:
+
+```powershell
+npx @modelcontextprotocol/inspector .venv\Scripts\python.exe app\app.py --mcp
+```
+
+### Runtime characteristics
+
+- Headless reuse of `VideoDlService`: no UI, no single-instance lock, no supervisor;
+- The engine is pre-warmed in the background at startup, so the first `parse_url`
+  does not pay the ~10s cold start;
+- stdin/stdout carry JSON-RPC only — all stray engine/child-process output is
+  forwarded to stderr and never pollutes the protocol stream;
+- Config and history are shared with the desktop app (`config.json` / `jobs.json`).
+
+### Client configuration example
+
+```json
+{
+  "mcpServers": {
+    "vd-downloader": {
+      "command": "python",
+      "args": ["D:\\CodeBuddy\\VideoDownLoad\\app\\app.py", "--mcp"],
+      "env": { "PYTHONIOENCODING": "utf-8" }
+    }
+  }
+}
+```
+
+### Tools (14)
+
+| Group | Tools | Purpose |
+|---|---|---|
+| Discovery | `list_sources` | Parsers + engine state + ffmpeg/node availability |
+| Parse | `parse_url` / `parse_urls` | URL(s) → quality items (each with a unique `key`) |
+| Download | `download` | Submit keys → `job_id` |
+| Download | `get_download_state` | Pure snapshot: returns immediately; poll until terminal status |
+| Download | `pause_job` / `resume_job` / `cancel_job` / `retry_audio` / `clear_jobs` | Job control |
+| Config | `get_config` / `set_config` | work_dir, concurrency, proxy, cookies, default quality |
+| History | `get_history` / `clear_history` | Parse history |
+
+### Known boundaries
+
+- Platform `login` needs the desktop GUI popup — sign in from the desktop app once;
+  the MCP server then shares the stored `per_source_cookies`;
+- The MCP server and the desktop app share the same config/job stores; avoid editing
+  configuration from both at the same time;
+- `get_download_state` is snapshot-only: poll it (every ~3-5s) until all item
+  statuses are terminal (done / error / cancelled / paused).
+
+---
+
 ## ⚙️ Configuration
 
 Config file: `C:\Users\<you>\AppData\Local\vd\vd-desktop\config.json`
